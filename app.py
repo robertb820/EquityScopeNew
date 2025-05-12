@@ -1,3 +1,4 @@
+# Import Section
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -7,9 +8,83 @@ from plotly.subplots import make_subplots
 import praw
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from datetime import datetime, timedelta
+import requests
 import time
+import logging
+import socket
+import json
+import os
+import smtplib
+from email.mime.text import MIMEText
 
-# Initialize session state for caching and theme
+# Email Configuration
+FROM_EMAIL = "coderedsupps@gmail.com"  # Replace with your Gmail address
+PASSWORD = "ygcr hggh infk rvie"  # Replace with your Gmail password or App Password
+
+def send_email(to_email, subject, content):
+    msg = MIMEText(content)
+    msg['Subject'] = subject
+    msg['From'] = FROM_EMAIL
+    msg['To'] = to_email
+    
+    try:
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(FROM_EMAIL, PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        return True
+    except Exception as e:
+        print(f"Error sending email: {e}")
+        return False
+
+def get_verification_email_content(email):
+    return f"""
+<html>
+<body>
+<h2>Stock Lookup Service Verification</h2>
+<p>Thank you for using our stock lookup service, {email}!</p>
+<p>You now have access to unlimited stock lookups.</p>
+<p>Best regards,<br>
+Stock Lookup Team</p>
+</body>
+</html>
+"""
+
+def get_welcome_email_content(email):
+    return f"""
+<html>
+<body>
+<h2>Welcome to Stock Lookup Service</h2>
+<p>Dear {email},</p>
+<p>We're glad you're interested in our service.</p>
+<p>Best regards,<br>
+Stock Lookup Team</p>
+</body>
+</html>
+"""
+
+# Set page config as the first Streamlit command
+st.set_page_config(
+    page_title="EquityScope: Stock Analyzer",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    page_icon="📈"
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Initialize session state at the top
+if "user_email" not in st.session_state:
+    logger.info("Initializing user_email in session state to None")
+    st.session_state.user_email = None
+if "email_submitted" not in st.session_state:
+    st.session_state.email_submitted = False
+if "stock_lookups" not in st.session_state:
+    logger.info("Initializing stock_lookups in session state to 0")
+    st.session_state.stock_lookups = 0
 if "cache" not in st.session_state:
     st.session_state.cache = {}
 if "theme" not in st.session_state:
@@ -27,8 +102,19 @@ if "theme_styles" not in st.session_state:
         "bar_colors": ["#00C4B4", "#FF6F61", "#F4A261", "#34D399", "#6B7280", "#A78BFA", "#EC4899", "#EF4444"],
         "calc_header": "#00A8E8"
     }
+if "api_requests_made" not in st.session_state:
+    st.session_state.api_requests_made = 0
+if "last_request_date" not in st.session_state:
+    st.session_state.last_request_date = datetime.now().date()
 
-# Reddit API setup (replace with your credentials)
+# Clear cache on startup to avoid stale data
+st.session_state.cache = {}
+
+# Reset API request counter
+st.session_state.api_requests_made = 0
+st.session_state.last_request_date = datetime.now().date()
+
+# Reddit API setup
 reddit = praw.Reddit(
     client_id="V3rxmA_qYIzBNTNW79LWIg",
     client_secret="xKBA3Nx7f7VQS0fXnOgmJhYZOmGasA",
@@ -38,120 +124,539 @@ reddit = praw.Reddit(
 # VADER sentiment analyzer
 analyzer = SentimentIntensityAnalyzer()
 
+# Alpha Vantage API key
+ALPHA_VANTAGE_API_KEY = "4OEV4A0EMNBMJP78"
+
+# Test network connectivity to Alpha Vantage
+def test_connectivity():
+    try:
+        socket.create_connection(("www.alphavantage.co", 443), timeout=5)
+        return True, "Successfully connected to Alpha Vantage."
+    except Exception as e:
+        return False, f"Failed to connect to Alpha Vantage: {str(e)}"
+
+# Validate Alpha Vantage API key
+def validate_alpha_vantage_api_key():
+    test_url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol=IBM&apikey=4OEV4A0EMNBMJP78"
+    try:
+        response = requests.get(test_url, timeout=30)
+        logger.info(f"Alpha Vantage API key validation response: {response.status_code}")
+        logger.debug(f"API key validation response content: {response.text}")
+        if response.status_code == 200:
+            data = response.json()
+            if "Note" in data or "Information" in data:
+                return False, "Rate limit exceeded or free tier limit reached."
+            if "Error Message" in data or not data:
+                return False, "Invalid Alpha Vantage API key."
+            return True, "API key is valid."
+        else:
+            return False, f"HTTP Error {response.status_code}: Unable to validate API key."
+    except Exception as e:
+        logger.error(f"Error validating API key: {str(e)}")
+        return False, f"Error validating API key: {str(e)}"
+
+# Check connectivity and API key at startup with error handling
+try:
+    conn_success, conn_message = test_connectivity()
+    if not conn_success:
+        st.error(f"Connectivity Issue: {conn_message}")
+        st.markdown("**Next Steps**: Ensure you're connected to the internet, disable any VPN/firewall, or fix DNS issues (e.g., use Google's DNS: 8.8.8.8).")
+except Exception as e:
+    st.error(f"Error checking connectivity: {str(e)}")
+
+try:
+    is_valid, validation_message = validate_alpha_vantage_api_key()
+    if not is_valid:
+        st.error(f"Alpha Vantage API Key Issue: {validation_message}")
+    else:
+        st.success("Alpha Vantage API key validated successfully!")
+except Exception as e:
+    st.error(f"Error validating API key: {str(e)}")
+
+# Retry decorator with exponential backoff
+def retry_with_backoff(func, max_attempts=5, initial_delay=5, backoff_factor=2):
+    def wrapper(*args, **kwargs):
+        delay = initial_delay
+        for attempt in range(max_attempts):
+            try:
+                result = func(*args, **kwargs)
+                if result is None:
+                    raise ValueError("API returned None")
+                return result
+            except Exception as e:
+                error_msg = str(e).lower()
+                logger.warning(f"Attempt {attempt+1} failed for {func.__name__}: {str(e)}")
+                if "429" in error_msg or "too many requests" in error_msg:
+                    logger.info(f"Rate limit hit for {func.__name__}, waiting {delay} seconds...")
+                elif "json" in error_msg or "expecting value" in error_msg:
+                    logger.info(f"JSON parsing issue for {func.__name__}, possibly empty response...")
+                if attempt == max_attempts - 1:
+                    logger.error(f"Max attempts reached for {func.__name__}: {str(e)}")
+                    return None, str(e)
+                time.sleep(delay)
+                delay *= backoff_factor
+        return None, "Max retries exceeded"
+    return wrapper
+
+# Alpha Vantage request counter
+def check_alpha_vantage_limit():
+    today = datetime.now().date()
+    if st.session_state.last_request_date != today:
+        st.session_state.api_requests_made = 0
+        st.session_state.last_request_date = today
+    if st.session_state.api_requests_made >= 25:  # Free tier limit
+        return False, "Daily limit of 25 requests reached for Alpha Vantage."
+    return True, ""
 # Cache stock info
+@retry_with_backoff
+def get_stock_info_alpha_vantage(ticker):
+    can_proceed, limit_message = check_alpha_vantage_limit()
+    if not can_proceed:
+        return None, limit_message
+    logger.info(f"Fetching stock info for {ticker} from Alpha Vantage")
+    try:
+        url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey=4OEV4A0EMNBMJP78"
+        response = requests.get(url, timeout=30)
+        logger.debug(f"Stock info response status for {ticker}: {response.status_code}")
+        logger.debug(f"Stock info response content: {response.text}")
+        st.session_state.api_requests_made += 1
+        if response.status_code == 200:
+            data = response.json()
+            if "Symbol" in data:
+                # Standardize market cap format
+                if "MarketCapitalization" in data:
+                    data["marketCap"] = float(data["MarketCapitalization"].replace(",", "").replace("$", "")) if data["MarketCapitalization"] else 0
+                return data, None
+            elif "Note" in data or "Information" in data:
+                return None, "Alpha Vantage rate limit exceeded or free tier limit reached."
+            else:
+                return None, "No data returned from Alpha Vantage."
+        else:
+            return None, f"Alpha Vantage HTTP Error {response.status_code}"
+    except Exception as e:
+        logger.error(f"Alpha Vantage error for {ticker}: {str(e)}")
+        return None, f"Alpha Vantage error: {str(e)}"
+
+@retry_with_backoff
+def get_stock_info_yfinance(ticker):
+    logger.info(f"Fetching stock info for {ticker} from yfinance")
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        if not info or "symbol" not in info:
+            return None, "No data returned from yfinance."
+        # Standardize market cap format
+        if "marketCap" in info:
+            info["marketCap"] = float(info["marketCap"]) if info["marketCap"] else 0
+        return info, None
+    except Exception as e:
+        logger.error(f"yfinance error for {ticker}: {str(e)}")
+        return None, f"yfinance error: {str(e)}"
+
 def get_stock_info(ticker):
-    if ticker not in st.session_state.cache:
-        try:
-            stock = yf.Ticker(ticker)
-            st.session_state.cache[ticker] = stock.info
-        except:
-            return None
-    return st.session_state.cache[ticker]
+    cache_key = f"info_{ticker}"
+    if cache_key not in st.session_state.cache:
+        # Try yfinance first
+        info, error = get_stock_info_yfinance(ticker)
+        if info and isinstance(info, dict):  # Ensure info is a dictionary
+            st.session_state.cache[cache_key] = info
+        else:
+            logger.warning(f"yfinance failed for {ticker}: {error}")
+            # Try Alpha Vantage fallback
+            info, error = get_stock_info_alpha_vantage(ticker)
+            if info and isinstance(info, dict):  # Ensure info is a dictionary
+                st.session_state.cache[cache_key] = info
+            else:
+                logger.error(f"Alpha Vantage also failed for {ticker}: {error}")
+                return None, f"Could not fetch stock info: {error}"
+    return st.session_state.cache[cache_key], None
+
 
 # Cache stock history
-def get_stock_history(ticker, period):
-    cache_key = f"{ticker}_{period}"
-    if cache_key not in st.session_state.cache:
-        try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period=period)
-            st.session_state.cache[cache_key] = hist
-        except:
-            return None
-    return st.session_state.cache[cache_key]
+@retry_with_backoff
+def get_stock_history_alpha_vantage(ticker, period):
+    can_proceed, limit_message = check_alpha_vantage_limit()
+    if not can_proceed:
+        return None, limit_message
+    logger.info(f"Fetching stock history for {ticker} - {period} from Alpha Vantage")
+    try:
+        time_series_map = {
+            "1d": ("TIME_SERIES_INTRADAY", "5min", "1D"),
+            "5d": ("TIME_SERIES_DAILY", None, "1W"),
+            "1mo": ("TIME_SERIES_DAILY", None, "1M"),
+            "6mo": ("TIME_SERIES_DAILY", None, "6M"),
+            "1y": ("TIME_SERIES_DAILY", None, "1Y"),
+            "5y": ("TIME_SERIES_WEEKLY", None, "5Y"),
+            "10y": ("TIME_SERIES_WEEKLY", None, "10Y"),
+            "max": ("TIME_SERIES_WEEKLY", None, "All")
+        }
+        function, interval, display_period = time_series_map.get(period, ("TIME_SERIES_DAILY", None, period))
+        if interval:
+            url = f"https://www.alphavantage.co/query?function={function}&symbol={ticker}&interval={interval}&apikey=4OEV4A0EMNBMJP78"
+        else:
+            url = f"https://www.alphavantage.co/query?function={function}&symbol={ticker}&apikey=4OEV4A0EMNBMJP78"
+        response = requests.get(url, timeout=30)
+        logger.debug(f"Stock history response status for {ticker} ({period}): {response.status_code}")
+        logger.debug(f"Stock history response content: {response.text}")
+        st.session_state.api_requests_made += 1
+        if response.status_code == 200:
+            data = response.json()
+            time_series_key = f"Time Series ({interval})" if interval else "Time Series" if function == "TIME_SERIES_DAILY" else "Weekly Time Series"
+            if time_series_key in data:
+                df = pd.DataFrame.from_dict(data[time_series_key], orient="index")
+                df.index = pd.to_datetime(df.index)
+                df = df.rename(columns={
+                    "4. close": "Close",
+                    "1. open": "Open",
+                    "2. high": "High",
+                    "3. low": "Low",
+                    "5. volume": "Volume"
+                })
+                df = df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
+                return df.sort_index(), None
+            elif "Note" in data or "Information" in data:
+                return None, "Alpha Vantage rate limit exceeded or free tier limit reached."
+            else:
+                return None, "No data returned from Alpha Vantage."
+        else:
+            return None, f"Alpha Vantage HTTP Error {response.status_code}"
+    except Exception as e:
+        logger.error(f"Alpha Vantage history error for {ticker}: {str(e)}")
+        return None, f"Alpha Vantage error: {str(e)}"
 
-# Company Info and Metrics
-st.set_page_config(
-    page_title="EquityScope: Stock Analyzer",
-    layout="wide",
-    initial_sidebar_state="expanded",
-    page_icon="📈"
+@retry_with_backoff
+def get_stock_history_yfinance(ticker, period):
+    logger.info(f"Fetching stock history for {ticker} - {period} from yfinance")
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period=period)
+        if hist.empty:
+            return None, "No data returned from yfinance."
+        if "Adj Close" in hist.columns:
+            hist = hist.drop(columns=["Adj Close"])
+        return hist, None
+    except Exception as e:
+        logger.error(f"yfinance history error for {ticker}: {str(e)}")
+        return None, f"yfinance error: {str(e)}"
+
+def get_stock_history(ticker, period):
+    cache_key = f"history_{ticker}_{period}"
+    if cache_key not in st.session_state.cache:
+        # Try Alpha Vantage first
+        hist, error = get_stock_history_alpha_vantage(ticker, period)
+        if hist is not None:
+            st.session_state.cache[cache_key] = hist
+        else:
+            logger.warning(f"Alpha Vantage failed for {ticker} history: {error}")
+            # Fallback to yfinance
+            hist, error = get_stock_history_yfinance(ticker, period)
+            if hist is not None:
+                st.session_state.cache[cache_key] = hist
+            else:
+                logger.error(f"yfinance also failed for {ticker} history: {error}")
+                return None, f"Could not fetch stock history: {error}"
+    return st.session_state.cache[cache_key], None
+
+import streamlit as st
+import smtplib
+from email.mime.text import MIMEText
+import logging
+import os
+
+# Configure logging
+if not os.path.exists('email.log'):
+    with open('email.log', 'w') as f:
+        f.write('')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='email.log'
 )
+logger = logging.getLogger(__name__)
+
+# Email Configuration
+FROM_EMAIL = "coderedsupps@gmail.com"
+PASSWORD = "ygcr hggh infk rvie"
+
+def send_email(to_email, subject, content):
+    msg = MIMEText(content, 'html')  # Specify HTML content type
+    msg['Subject'] = subject
+    msg['From'] = FROM_EMAIL
+    msg['To'] = to_email
+    
+    try:
+        logger.info(f"Attempting to send email to {to_email}")
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(FROM_EMAIL, PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        logger.info(f"Email sent successfully to {to_email}")
+        return True
+    except Exception as e:
+        logger.error(f"Error sending email to {to_email}: {e}")
+        return False
+
+def get_verification_email_content(email):
+    return f"""
+<html>
+<body>
+<h2>EquityScope Service Verification</h2>
+<p>Thank you for using EquityScope, {email}!</p>
+<p>You now have access to unlimited stock lookups.</p>
+<p>Best regards,<br>
+EquityScope Team</p>
+</body>
+</html>
+"""
+
+def get_welcome_email_content(email):
+    return f"""
+<html>
+<body>
+<h2>Welcome to EquityScope</h2>
+<p>Dear {email},</p>
+<p>We're glad you're interested in our service.</p>
+<p>Best regards,<br>
+Stock Lookup Team</p>
+</body>
+</html>
+"""
+
+
+
+
+# Streamlit page title
 st.title("📈 EquityScope: Stock Analyzer")
 
-# Theme toggle
+# Sidebar Theme Toggle
 st.sidebar.title("Settings")
-theme = st.sidebar.radio("Select Theme:", ["Light", "Dark"], index=0 if st.session_state.theme == "light" else 1)
-st.session_state.theme = theme.lower()
+# Ensure theme is initialized
+if "theme" not in st.session_state:
+    st.session_state.theme = "light"
+# Let user choose theme
+selected_theme = st.sidebar.radio("Select Theme:", ["Light", "Dark"],
+                                index=0 if st.session_state.theme == "light" else 1)
+st.session_state.theme = selected_theme.lower()
 
-# Define theme styles
-light_theme = {
-    "bg": "#FFFFFF",
-    "text": "#111827",
-    "plot_bg": "rgba(240, 240, 240, 0.5)",
-    "grid": "rgba(150, 150, 150, 0.5)",
-    "line": "#00A8E8",
-    "sma20": "#FF6F61",
-    "sma50": "#6B7280",
-    "sma200": "#34D399",
-    "bar_colors": ["#00C4B4", "#FF6F61", "#F4A261", "#34D399", "#6B7280", "#A78BFA", "#EC4899", "#EF4444"],
-    "calc_header": "#00A8E8"
+# Define themes
+themes = {
+    "light": {
+        "bg": "#FFFFFF",
+        "text": "#111827",
+        "plot_bg": "rgba(240, 240, 240, 0.5)",
+        "grid": "rgba(150, 150, 150, 0.5)",
+        "line": "#00A8E8",
+        "sma20": "#FF6F61",
+        "sma50": "#6B7280",
+        "sma200": "#34D399",
+        "bar_colors": ["#00C4B4", "#FF6F61", "#F4A261", "#34D399", "#6B7280", "#A78BFA", "#EC4899", "#EF4444"],
+        "calc_header": "#00A8E8",
+        "header": "#000000",
+        "input_bg": "#F3F4F6",
+        "button_bg": "#E5E7EB",
+        "button_text": "#111827"
+    },
+    "dark": {
+        "bg": "#1F2937",
+        "text": "#FFFFFF",
+        "plot_bg": "rgba(31, 41, 55, 0.8)",
+        "grid": "rgba(107, 114, 128, 0.5)",
+        "line": "#60A5FA",
+        "sma20": "#F87171",
+        "sma50": "#9CA3AF",
+        "sma200": "#34D399",
+        "bar_colors": ["#2DD4BF", "#F87171", "#FBBF24", "#34D399", "#9CA3AF", "#C4B5FD", "#F472B6", "#F87171"],
+        "calc_header": "#60A5FA",
+        "header": "#FFFFFF",
+        "input_bg": "#374151",
+        "button_bg": "#4B5563",
+        "button_text": "#FFFFFF"
+    }
 }
-dark_theme = {
-    "bg": "#1F2937",
-    "text": "#F3F4F6",
-    "plot_bg": "rgba(31, 41, 55, 0.8)",
-    "grid": "rgba(107, 114, 128, 0.5)",
-    "line": "#60A5FA",
-    "sma20": "#F87171",
-    "sma50": "#9CA3AF",
-    "sma200": "#34D399",
-    "bar_colors": ["#2DD4BF", "#F87171", "#FBBF24", "#34D399", "#9CA3AF", "#C4B5FD", "#F472B6", "#F87171"],
-    "calc_header": "#60A5FA"
-}
-st.session_state.theme_styles = light_theme if st.session_state.theme == "light" else dark_theme
 
-# Apply CSS with updated styles for sidebar background and tick labels
+# Set styles in session
+st.session_state.theme_styles = themes[st.session_state.theme]
+
+# Apply CSS theme styles
+def apply_custom_theme_styles():
+    styles = st.session_state.theme_styles
+    st.markdown(
+        f"""
+        <style>
+            .main {{
+                background-color: {styles["bg"]};
+                color: {styles["text"]};
+            }}
+            
+            /* Dropdown visibility fixes */
+            .stSelectbox > div {{
+                background-color: inherit !important;
+            }}
+            
+            [data-baseweb="select"] {{
+                color: #000000 !important;
+                background-color: #ffffff !important;
+            }}
+            
+            [data-theme="dark"] [data-baseweb="select"] {{
+                color: #ffffff !important;
+                background-color: #374151 !important;
+            }}
+            
+            .stSelectbox div div {{
+                background-color: #ffffff !important;
+                color: #000000 !important;
+            }}
+            
+            [data-theme="dark"] .stSelectbox div div {{
+                background-color: #374151 !important;
+                color: #ffffff !important;
+            }}
+            
+            h1, h2, h3, h4, h5, h6 {{
+                color: {styles["header"]} !important;
+            }}
+            
+            input[type="text"], 
+            input[type="number"], 
+            textarea {{
+                background-color: {styles["input_bg"]} !important;
+                color: {styles["text"]} !important;
+            }}
+            
+            .stTextInput > div > input {{
+                background-color: {styles["input_bg"]} !important;
+                color: {styles["text"]} !important;
+            }}
+            
+            .stDownloadButton > button,
+            .stButton > button {{
+                background-color: {styles["button_bg"]} !important;
+                color: {styles["button_text"]} !important;
+                border: none;
+                border-radius: 5px;
+            }}
+            
+            .stDownloadButton > button:hover,
+            .stButton > button:hover {{
+                opacity: 0.9;
+                cursor: pointer;
+            }}
+            
+            .stRadio > div > label,
+            .stSelectbox > div,
+            .stMarkdown, 
+            .stText, 
+            label, 
+            div, 
+            span {{
+                color: {styles["text"]} !important;
+            }}
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+apply_custom_theme_styles()
+
+# Additional global style adjustments
 st.markdown(f"""
 <style>
     .stApp {{
         background-color: {st.session_state.theme_styles['bg']} !important;
         color: {st.session_state.theme_styles['text']} !important;
     }}
-    .stMarkdown, .stRadio > label, .stAlert, .company-info, .description, .metric-value, .calc-header, .st-expander {{
+    
+    .stMarkdown, 
+    .stRadio > label, 
+    .stAlert, 
+    .company-info, 
+    .description, 
+    .metric-value, 
+    .calc-header, 
+    .st-expander {{
         color: {st.session_state.theme_styles['text']} !important;
         opacity: 1 !important;
     }}
+    
     .calc-header {{
         color: {st.session_state.theme_styles['calc_header']} !important;
         font-size: 18px;
         font-weight: bold;
         margin-top: 10px;
     }}
-    [data-testid="stTextInput"] label, [data-testid="stTextInput"] div p {{
-        color: {st.session_state.theme_styles['text']} !important;
-        opacity: 1 !important;
-    }}
+    
     [data-testid="stSidebar"] {{
-        background-color: { '#F9FAFB' if st.session_state.theme == 'light' else '#374151' } !important;
+        background-color: {'#F9FAFB' if st.session_state.theme == 'light' else '#374151'} !important;
     }}
-    [data-testid="stSidebar"] div, [data-testid="stSidebar"] label, [data-testid="stSidebar"] p, [data-testid="stSidebar"] h1 {{
+    
+    [data-testid="stSidebar"] div, 
+    [data-testid="stSidebar"] label, 
+    [data-testid="stSidebar"] p, 
+    [data-testid="stSidebar"] h1 {{
         color: {st.session_state.theme_styles['text']} !important;
         opacity: 1 !important;
     }}
-    [data-testid="stSidebar"] .stRadio > label, [data-testid="stSidebar"] .stRadio > label p, [data-testid="stSidebar"] .stRadio > div p {{
-        color: {st.session_state.theme_styles['text']} !important;
-        opacity: 1 !important;
-    }}
+    
     [data-testid="stDataFrame"] a {{
         color: {st.session_state.theme_styles['text']} !important;
         text-decoration: underline !important;
     }}
-    .stApp[style*="background-color: #FFFFFF"] .js-plotly-plot .plotly .ticktext {{
-        fill: #000000 !important;
-        color: #000000 !important;
-    }}
+    
+    .stApp[style*="background-color: #FFFFFF"] .js-plotly-plot .plotly .ticktext,
     .stApp[style*="background-color: #FFFFFF"] .js-plotly-plot .plotly .g-xtitle,
     .stApp[style*="background-color: #FFFFFF"] .js-plotly-plot .plotly .g-ytitle {{
         fill: #000000 !important;
         color: #000000 !important;
     }}
 </style>
-""", unsafe_allow_html=True)
+""",
+unsafe_allow_html=True)
 
-# Company info
+# Inject theme styles
+apply_custom_theme_styles()
+
+def get_verification_email_content(email):
+    return f"""
+    <html>
+        <body>
+            <h2>EquityScope Service Verification</h2>
+            <p>Thank you for using EquityScope, {email}!</p>
+            <p>You now have access to unlimited stock lookups.</p>
+            <p>Best regards,<br>
+            EquityScope Team</p>
+        </body>
+    </html>
+    """
+
+def get_welcome_email_content(email):
+    return f"""
+    <html>
+        <body>
+            <h2>Welcome to EquityScope</h2>
+            <p>Dear {email},</p>
+            <p>We're glad you're interested in our service.</p>
+            <p>Best regards,<br>
+            EquityScope Team</p>
+        </body>
+    </html>
+    """
+# Debug Section
+st.sidebar.subheader("Debug Info")
+if st.sidebar.checkbox("Show Debug Logs"):
+    st.sidebar.markdown("Check your terminal for detailed logs.")
+st.sidebar.markdown(f"Alpha Vantage Requests Made Today: {st.session_state.api_requests_made}/25")
+
+# Manual cache reset
+if st.sidebar.button("Clear Cache"):
+    st.session_state.cache = {}
+    st.session_state.api_requests_made = 0
+    st.experimental_rerun()
+
+# Company Info with Email Feature
 st.subheader("🔍 Company Information")
-stock_ticker = st.text_input("Enter a stock ticker (e.g., AAPL):", value="AAPL").strip().upper()
+st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Enter a stock ticker to analyze (e.g., AAPL for Apple).</p>', unsafe_allow_html=True)
 
 def market_cap_display(market_cap):
     if isinstance(market_cap, (int, float)):
@@ -163,42 +668,139 @@ def market_cap_display(market_cap):
             return f"${market_cap / 1_000_000:.2f}M"
     return "N/A"
 
+stock_ticker = st.text_input("Enter a stock ticker (e.g., AAPL):", value="AAPL").strip().upper()
+
 if stock_ticker:
+    logger.info(f"Attempting stock lookup for {stock_ticker}, current lookups: {st.session_state.stock_lookups}")
+    
+    # Check if user has reached limit and hasn't submitted email
+    if st.session_state.stock_lookups > 3 and not st.session_state.email_submitted:
+        st.error("You have reached the limit of 3 free stock lookups.")
+        st.markdown("To request more lookups, please provide your email address here:")
+        email_input = st.text_input("Enter your email address:", key="email_input")
+        
+        if st.button("Submit Email"):
+            if email_input and "@" in email_input and "." in email_input:
+                st.session_state.user_email = email_input
+                st.session_state.email_submitted = True
+                logger.info(f"User submitted email: {email_input} for more lookups")
+                
+                # Send welcome email
+                success = send_email(
+                    to_email=email_input,
+                    subject="Welcome to EquityScope",
+                    content=get_welcome_email_content(email_input)
+                )
+                
+                if success:
+                    st.success(f"Welcome email sent to {email_input}! Check your inbox (and spam folder).")
+                else:
+                    st.error("Failed to send welcome email. Please check logs for details.")
+            else:
+                st.error("Please enter a valid email address.")
+            st.stop()
+        
+        # Stop here if user hasn't submitted email
+        st.stop()
+    
+    # Only allow stock lookup if user is under limit or has submitted email
     with st.spinner("Fetching company info..."):
-        stock_info = get_stock_info(stock_ticker)
+        stock_info, error = get_stock_info(stock_ticker)
         if stock_info:
-            company_name = stock_info.get("longName", "N/A")
-            sector = stock_info.get("sector", "N/A")
-            market_cap = stock_info.get("marketCap")
-            summary = stock_info.get("longBusinessSummary", "No description available.")
+            st.session_state.stock_lookups += 1
+            st.session_state.stock_info = stock_info
+            st.session_state.ticker = stock_ticker
+            logger.info(f"Lookup successful, incremented to: {st.session_state.stock_lookups}")
+            
+            company_name = stock_info.get("Name", stock_info.get("longName", "N/A"))
+            sector = stock_info.get("Sector", stock_info.get("sector", "N/A"))
+            industry = stock_info.get("Industry", stock_info.get("industry", "N/A"))
+            market_cap = float(stock_info.get("MarketCapitalization", stock_info.get("marketCap", 0)))
+            summary = stock_info.get("Description", stock_info.get("longBusinessSummary", "No description available."))
+            website = stock_info.get("Website", stock_info.get("website", "N/A"))
+            
+            st.markdown(f'<p class="company-info"><strong>Company:</strong> {company_name} | <strong>Sector:</strong> {sector} | <strong>Industry:</strong> {industry} | <strong>Market Cap:</strong> {market_cap_display(market_cap)} | <strong>Website:</strong> <a href="{website}" target="_blank">{website}</a></p>', unsafe_allow_html=True)
+            st.markdown(f'<p class="description">{summary}</p>', unsafe_allow_html=True)
+        else:
+            st.error(f"Could not fetch company info for {stock_ticker}: {error}")
+            st.markdown("Check your terminal logs for detailed error messages. Ensure you're connected to the internet, or try clearing the cache using the button in the sidebar.")
+
+    with st.spinner("Fetching company info..."):
+        stock_info, error = get_stock_info(stock_ticker)
+        if stock_info:
+            st.session_state.stock_lookups += 1
+            st.session_state.stock_info = stock_info
+            st.session_state.ticker = stock_ticker
+            logger.info(f"Lookup successful, incremented to: {st.session_state.stock_lookups}")
+            company_name = stock_info.get("Name", stock_info.get("longName", "N/A"))
+            sector = stock_info.get("Sector", stock_info.get("sector", "N/A"))
+            industry = stock_info.get("Industry", stock_info.get("industry", "N/A"))
+            market_cap = float(stock_info.get("MarketCapitalization", stock_info.get("marketCap", 0)))
+            summary = stock_info.get("Description", stock_info.get("longBusinessSummary", "No description available."))
+            website = stock_info.get("Website", stock_info.get("website", "N/A"))
             st.markdown(
                 f'<p class="company-info"><strong>Company:</strong> {company_name} | '
                 f'<strong>Sector:</strong> {sector} | '
-                f'<strong>Market Cap:</strong> {market_cap_display(market_cap)}</p>',
+                f'<strong>Industry:</strong> {industry} | '
+                f'<strong>Market Cap:</strong> {market_cap_display(market_cap)} | '
+                f'<strong>Website:</strong> <a href="{website}" target="_blank">{website}</a></p>',
                 unsafe_allow_html=True
             )
             st.markdown(f'<p class="description">{summary}</p>', unsafe_allow_html=True)
         else:
-            st.warning(f"Could not fetch company info for {stock_ticker}.")
+            st.error(f"Could not fetch company info for {stock_ticker}: {error}")
+            st.markdown("**Next Steps**: Check the terminal logs for detailed error messages. Ensure you're connected to the internet, or try clearing the cache using the button in the sidebar.")
+else:
+    st.session_state.stock_info = None
+    st.session_state.ticker = None
 
-# Key metrics
+# Key Metrics
 st.subheader("📊 Key Metrics")
 if stock_ticker:
     with st.spinner("Fetching key metrics..."):
-        stock_info = get_stock_info(stock_ticker)
-        if stock_info:
-            pe_ratio = stock_info.get("trailingPE", "N/A")
-            pb_ratio = stock_info.get("priceToBook", "N/A")
-            pe_display = f"{pe_ratio:.2f}" if isinstance(pe_ratio, (int, float)) else pe_ratio
-            pb_display = f"{pb_ratio:.2f}" if isinstance(pb_ratio, (int, float)) else pb_ratio
+        stock_info, error = get_stock_info(stock_ticker)
+        if stock_info and isinstance(stock_info, dict):  # Ensure stock_info is a dictionary
+            metrics = {}
+            # Safely extract metrics with default values
+            pe_ratio = stock_info.get("PERatio", stock_info.get("trailingPE", "N/A"))
+            metrics["P/E Ratio"] = float(pe_ratio) if pe_ratio != "N/A" and pe_ratio is not None else "N/A"
+            
+            pb_ratio = stock_info.get("PriceToBookRatio", stock_info.get("priceToBook", "N/A"))
+            metrics["P/B Ratio"] = float(pb_ratio) if pb_ratio != "N/A" and pb_ratio is not None else "N/A"
+            
+            dividend_yield = stock_info.get("DividendYield", stock_info.get("dividendYield", 0))
+            metrics["Dividend Yield"] = float(dividend_yield) * 100 if dividend_yield != "N/A" and dividend_yield is not None else 0
+            
+            beta = stock_info.get("Beta", stock_info.get("beta", "N/A"))
+            metrics["Beta"] = float(beta) if beta != "N/A" and beta is not None else "N/A"
+            
+            roe = stock_info.get("ReturnOnEquityTTM", stock_info.get("returnOnEquity", "N/A"))
+            metrics["ROE"] = float(roe) * 100 if roe != "N/A" and roe is not None else "N/A"
+            
+            debt_equity = stock_info.get("DebtToEquity", stock_info.get("debtToEquity", "N/A"))
+            metrics["Debt/Equity"] = float(debt_equity) if debt_equity != "N/A" and debt_equity is not None else "N/A"
+            
+            ps_ratio = stock_info.get("PriceToSalesRatioTTM", stock_info.get("priceToSalesTrailing12Months", "N/A"))
+            metrics["P/S Ratio"] = float(ps_ratio) if ps_ratio != "N/A" and ps_ratio is not None else "N/A"
+            
+            # Format metrics for display
+            metrics_display = []
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)) and not pd.isna(value):
+                    if key in ["Dividend Yield", "ROE"]:
+                        metrics_display.append(f"{key}: {value:.2f}%")
+                    else:
+                        metrics_display.append(f"{key}: {value:.2f}")
+                else:
+                    metrics_display.append(f"{key}: N/A")
             st.markdown(
-                f'<p class="metric-value">P/E Ratio: {pe_display} | P/B Ratio: {pb_display}</p>',
+                f'<p class="metric-value">{" | ".join(metrics_display)}</p>',
                 unsafe_allow_html=True
             )
         else:
-            st.warning("Could not fetch key metrics.")
+            st.warning(f"Could not fetch key metrics for {stock_ticker}: {error}")
 
-# Price history
+# Price History
 st.subheader("📈 Price History")
 time_frame_options = ["1D", "1W", "1M", "6M", "1Y", "5Y", "10Y", "All"]
 time_frame_map = {"1D": "1d", "1W": "5d", "1M": "1mo", "6M": "6mo", "1Y": "1y", "5Y": "5y", "10Y": "10y", "All": "max"}
@@ -207,156 +809,306 @@ selected_period = time_frame_map[selected_time_frame]
 
 if stock_ticker:
     with st.spinner(f"Fetching price history for {selected_time_frame}..."):
-        hist = get_stock_history(stock_ticker, period=selected_period)
+        hist, error = get_stock_history(stock_ticker, period=selected_period)
         if hist is not None and not hist.empty:
-            axis_text_color = "#000000" if st.session_state.theme == "light" else st.session_state.theme_styles['text']
+            axis_text_color = "#000000" if st.session_state.theme == "light" else "#FFFFFF"
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"], mode="lines", name="Close Price", line=dict(color=st.session_state.theme_styles["line"])))
+            fig.add_trace(go.Scatter(
+                x=hist.index,
+                y=hist["Close"],
+                mode="lines",
+                name="Close Price",
+                line=dict(color=st.session_state.theme_styles["line"], width=2)
+            ))
+            fig.add_trace(go.Bar(
+                x=hist.index,
+                y=hist["Volume"],
+                name="Volume",
+                yaxis="y2",
+                opacity=0.3,
+                marker_color=st.session_state.theme_styles["sma50"]
+            ))
             fig.update_layout(
-                title=dict(text=f"{stock_ticker} Price ({selected_time_frame})", font=dict(color=st.session_state.theme_styles["text"])),
+                title=dict(
+                    text=f"{stock_ticker} Price and Volume ({selected_time_frame})",
+                    font=dict(size=20, color=axis_text_color),
+                    x=0.5,
+                    xanchor="center"
+                ),
                 xaxis_title="Date",
                 yaxis_title="Price (USD)",
+                yaxis2=dict(
+                    title="Volume",
+                    overlaying="y",
+                    side="right",
+                    tickfont=dict(color=axis_text_color, size=12)
+                ),
                 plot_bgcolor=st.session_state.theme_styles["plot_bg"],
-                paper_bgcolor=st.session_state.theme_styles["bg"],
+                paper_bgcolor="rgba(0,0,0,0)",  # Transparent paper background
                 font=dict(family="Arial", size=12, color=axis_text_color),
-                legend=dict(font=dict(color=axis_text_color)),
+                legend=dict(
+                    x=0,
+                    y=1.1,
+                    orientation="h",
+                    font=dict(color=axis_text_color)
+                ),
                 xaxis=dict(
-                    title=dict(font=dict(color=axis_text_color)),
+                    title=dict(text="Date", font=dict(color=axis_text_color, size=14)),
                     tickfont=dict(family="Arial", size=12, color=axis_text_color),
-                    gridcolor=st.session_state.theme_styles["grid"]
+                    gridcolor=st.session_state.theme_styles["grid"],
+                    zeroline=False
                 ),
                 yaxis=dict(
-                    title=dict(font=dict(color=axis_text_color)),
+                    title=dict(text="Price (USD)", font=dict(color=axis_text_color, size=14)),
                     tickfont=dict(family="Arial", size=12, color=axis_text_color),
-                    gridcolor=st.session_state.theme_styles["grid"]
-                )
+                    gridcolor=st.session_state.theme_styles["grid"],
+                    zeroline=False
+                ),
+                height=500,
+                margin=dict(l=50, r=50, t=80, b=50)
             )
-            fig.update_xaxes(tickfont=dict(family="Arial", size=12, color=axis_text_color))
-            fig.update_yaxes(tickfont=dict(family="Arial", size=12, color=axis_text_color))
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning(f"Could not fetch price history for {stock_ticker}.")
-
-# Moving averages
+            st.warning(f"Could not fetch price history for {stock_ticker}: {error}")
+# Moving Averages
 st.subheader("📈 Moving Averages")
 if selected_time_frame in ["1D", "1W", "1M"]:
     st.warning("Note: 50-day and 200-day SMAs may be less reliable for short time frames.")
 if stock_ticker:
     with st.spinner(f"Calculating moving averages..."):
-        hist = get_stock_history(stock_ticker, period=selected_period)
+        hist, error = get_stock_history(stock_ticker, period=selected_period)
         if hist is not None and not hist.empty:
             sma_20 = hist["Close"].rolling(window=20).mean()
             sma_50 = hist["Close"].rolling(window=50).mean()
             sma_200 = hist["Close"].rolling(window=200).mean()
-            axis_text_color = "#000000" if st.session_state.theme == "light" else st.session_state.theme_styles['text']
+            axis_text_color = "#000000" if st.session_state.theme == "light" else "#FFFFFF"
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"], mode="lines", name="Close Price", line=dict(color=st.session_state.theme_styles["line"])))
-            fig.add_trace(go.Scatter(x=hist.index, y=sma_20, mode="lines", name="20-day SMA", line=dict(color=st.session_state.theme_styles["sma20"])))
-            fig.add_trace(go.Scatter(x=hist.index, y=sma_50, mode="lines", name="50-day SMA", line=dict(color=st.session_state.theme_styles["sma50"])))
-            fig.add_trace(go.Scatter(x=hist.index, y=sma_200, mode="lines", name="200-day SMA", line=dict(color=st.session_state.theme_styles["sma200"])))
+            fig.add_trace(go.Scatter(
+                x=hist.index,
+                y=hist["Close"],
+                mode="lines",
+                name="Close Price",
+                line=dict(color=st.session_state.theme_styles["line"], width=2)
+            ))
+            fig.add_trace(go.Scatter(
+                x=hist.index,
+                y=sma_20,
+                mode="lines",
+                name="20-day SMA",
+                line=dict(color=st.session_state.theme_styles["sma20"], width=1.5)
+            ))
+            fig.add_trace(go.Scatter(
+                x=hist.index,
+                y=sma_50,
+                mode="lines",
+                name="50-day SMA",
+                line=dict(color=st.session_state.theme_styles["sma50"], width=1.5)
+            ))
+            fig.add_trace(go.Scatter(
+                x=hist.index,
+                y=sma_200,
+                mode="lines",
+                name="200-day SMA",
+                line=dict(color=st.session_state.theme_styles["sma200"], width=1.5)
+            ))
             fig.update_layout(
-                title=dict(text=f"{stock_ticker} Moving Averages ({selected_time_frame})", font=dict(color=st.session_state.theme_styles["text"])),
+                title=dict(
+                    text=f"{stock_ticker} Moving Averages ({selected_time_frame})",
+                    font=dict(size=20, color=axis_text_color),
+                    x=0.5,
+                    xanchor="center"
+                ),
                 xaxis_title="Date",
                 yaxis_title="Price (USD)",
                 showlegend=True,
-                legend=dict(font=dict(color=axis_text_color)),
+                legend=dict(
+                    x=0,
+                    y=1.1,
+                    orientation="h",
+                    font=dict(color=axis_text_color)
+                ),
                 plot_bgcolor=st.session_state.theme_styles["plot_bg"],
-                paper_bgcolor=st.session_state.theme_styles["bg"],
+                paper_bgcolor="rgba(0,0,0,0)",
                 font=dict(family="Arial", size=12, color=axis_text_color),
                 xaxis=dict(
-                    title=dict(font=dict(color=axis_text_color)),
+                    title=dict(text="Date", font=dict(color=axis_text_color, size=14)),
                     tickfont=dict(family="Arial", size=12, color=axis_text_color),
-                    gridcolor=st.session_state.theme_styles["grid"]
+                    gridcolor=st.session_state.theme_styles["grid"],
+                    zeroline=False
                 ),
                 yaxis=dict(
-                    title=dict(font=dict(color=axis_text_color)),
+                    title=dict(text="Price (USD)", font=dict(color=axis_text_color, size=14)),
                     tickfont=dict(family="Arial", size=12, color=axis_text_color),
-                    gridcolor=st.session_state.theme_styles["grid"]
-                )
+                    gridcolor=st.session_state.theme_styles["grid"],
+                    zeroline=False
+                ),
+                height=500,
+                margin=dict(l=50, r=50, t=80, b=50)
             )
-            fig.update_xaxes(tickfont=dict(family="Arial", size=12, color=axis_text_color))
-            fig.update_yaxes(tickfont=dict(family="Arial", size=12, color=axis_text_color))
             st.plotly_chart(fig, use_container_width=True)
-            st.markdown("""
-            **Moving Averages Explanation**: SMAs smooth price data to identify trends. The 20-day SMA reflects short-term trends, 50-day medium-term, and 200-day long-term.
-            """)
+            st.markdown("**Moving Averages Explanation**: SMAs smooth price data to identify trends. A golden cross (50-day SMA crossing above 200-day SMA) is bullish, while a death cross (50-day SMA crossing below 200-day SMA) is bearish.")
         else:
-            st.warning(f"Could not fetch price history for moving averages.")
+            st.warning(f"Could not fetch price history for moving averages: {error}")
 
-# Technical indicators graph
+# Technical Indicators Graph
 st.subheader("📉 Technical Indicators Graph")
+
 if selected_time_frame in ["1D", "1W", "1M"]:
     st.warning("Note: Bollinger Bands and MACD may be less reliable for short time frames.")
+
 if stock_ticker:
     with st.spinner(f"Calculating technical indicators..."):
-        hist = get_stock_history(stock_ticker, period=selected_period)
+        hist, error = get_stock_history(stock_ticker, period=selected_period)
+
         if hist is not None and not hist.empty:
+            # Calculate technical indicators
             window = 20
             sma = hist["Close"].rolling(window=window).mean()
             std = hist["Close"].rolling(window=window).std()
             upper_band = sma + (std * 2)
             lower_band = sma - (std * 2)
+
             exp12 = hist["Close"].ewm(span=12, adjust=False).mean()
             exp26 = hist["Close"].ewm(span=26, adjust=False).mean()
             macd = exp12 - exp26
             signal = macd.ewm(span=9, adjust=False).mean()
             histogram = macd - signal
-            axis_text_color = "#000000" if st.session_state.theme == "light" else st.session_state.theme_styles['text']
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, subplot_titles=(f"{stock_ticker} Price with Bollinger Bands", "MACD"), row_heights=[0.7, 0.3])
-            fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"], mode="lines", name="Close Price", line=dict(color=st.session_state.theme_styles["line"])), row=1, col=1)
-            fig.add_trace(go.Scatter(x=hist.index, y=upper_band, mode="lines", name="Upper Band", line=dict(color=st.session_state.theme_styles["sma50"], dash="dash")), row=1, col=1)
-            fig.add_trace(go.Scatter(x=hist.index, y=lower_band, mode="lines", name="Lower Band", line=dict(color=st.session_state.theme_styles["sma50"], dash="dash")), row=1, col=1)
-            fig.add_trace(go.Scatter(x=hist.index, y=macd, mode="lines", name="MACD", line=dict(color=st.session_state.theme_styles["line"])), row=2, col=1)
-            fig.add_trace(go.Scatter(x=hist.index, y=signal, mode="lines", name="Signal Line", line=dict(color=st.session_state.theme_styles["sma20"])), row=2, col=1)
-            fig.add_trace(go.Bar(x=hist.index, y=histogram, name="Histogram", marker_color=st.session_state.theme_styles["sma50"]), row=2, col=1)
+
+            axis_text_color = "#000000" if st.session_state.theme == "light" else "#FFFFFF"
+
+            # Create subplots
+            fig = make_subplots(
+                rows=2,
+                cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.15,  # Increased spacing between graphs
+                subplot_titles=(
+                    f"{stock_ticker} Price with Bollinger Bands",
+                    "MACD (Moving Average Convergence Divergence)"
+                ),
+                row_heights=[0.65, 0.35]
+            )
+
+            # Price and Bollinger Bands
+            fig.add_trace(go.Scatter(
+                x=hist.index,
+                y=hist["Close"],
+                mode="lines",
+                name="Close Price",
+                line=dict(color=st.session_state.theme_styles["line"], width=2)
+            ), row=1, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=hist.index,
+                y=upper_band,
+                mode="lines",
+                name="Upper Band",
+                line=dict(color=st.session_state.theme_styles["sma50"], width=1, dash="dash")
+            ), row=1, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=hist.index,
+                y=lower_band,
+                mode="lines",
+                name="Lower Band",
+                line=dict(color=st.session_state.theme_styles["sma50"], width=1, dash="dash")
+            ), row=1, col=1)
+
+            # MACD and Histogram
+            fig.add_trace(go.Scatter(
+                x=hist.index,
+                y=macd,
+                mode="lines",
+                name="MACD",
+                line=dict(color=st.session_state.theme_styles["line"], width=1.5)
+            ), row=2, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=hist.index,
+                y=signal,
+                mode="lines",
+                name="Signal Line",
+                line=dict(color=st.session_state.theme_styles["sma20"], width=1.5)
+            ), row=2, col=1)
+
+            fig.add_trace(go.Bar(
+                x=hist.index,
+                y=histogram,
+                name="Histogram",
+                marker_color=st.session_state.theme_styles["sma50"]
+            ), row=2, col=1)
+
+            # Final Layout
             fig.update_layout(
-                height=600,
-                title=dict(text=f"{stock_ticker} Technical Indicators ({selected_time_frame})", font=dict(color=st.session_state.theme_styles["text"])),
+                height=700,
+                title=dict(
+                    text=f"{stock_ticker} Technical Indicators ({selected_time_frame})",
+                    font=dict(size=20, color=axis_text_color),
+                    x=0.5,
+                    xanchor="center",
+                    y=0.95
+                ),
                 showlegend=True,
-                legend=dict(font=dict(color=axis_text_color)),
-                xaxis2_title="Date",
-                yaxis_title="Price (USD)",
-                yaxis2_title="MACD",
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.05,
+                    xanchor="left",
+                    x=0,
+                    font=dict(color=axis_text_color)
+                ),
+                margin=dict(t=100, b=60, l=60, r=60),
                 plot_bgcolor=st.session_state.theme_styles["plot_bg"],
-                paper_bgcolor=st.session_state.theme_styles["bg"],
+                paper_bgcolor="rgba(0,0,0,0)",
                 font=dict(family="Arial", size=12, color=axis_text_color),
                 xaxis=dict(
-                    title=dict(font=dict(color=axis_text_color)),
-                    tickfont=dict(family="Arial", size=12, color=axis_text_color),
-                    gridcolor=st.session_state.theme_styles["grid"]
-                ),
-                yaxis=dict(
-                    title=dict(font=dict(color=axis_text_color)),
-                    tickfont=dict(family="Arial", size=12, color=axis_text_color),
-                    gridcolor=st.session_state.theme_styles["grid"]
+                    title="Date",
+                    title_font=dict(color=axis_text_color, size=14),
+                    tickfont=dict(color=axis_text_color),
+                    gridcolor=st.session_state.theme_styles["grid"],
+                    zeroline=False
                 ),
                 xaxis2=dict(
-                    title=dict(font=dict(color=axis_text_color)),
-                    tickfont=dict(family="Arial", size=12, color=axis_text_color),
-                    gridcolor=st.session_state.theme_styles["grid"]
+                    title="Date",
+                    title_font=dict(color=axis_text_color, size=14),
+                    tickfont=dict(color=axis_text_color),
+                    gridcolor=st.session_state.theme_styles["grid"],
+                    zeroline=False
+                ),
+                yaxis=dict(
+                    title="Price (USD)",
+                    title_font=dict(color=axis_text_color, size=14),
+                    tickfont=dict(color=axis_text_color),
+                    gridcolor=st.session_state.theme_styles["grid"],
+                    zeroline=False
                 ),
                 yaxis2=dict(
-                    title=dict(font=dict(color=axis_text_color)),
-                    tickfont=dict(family="Arial", size=12, color=axis_text_color),
-                    gridcolor=st.session_state.theme_styles["grid"]
+                    title="MACD",
+                    title_font=dict(color=axis_text_color, size=14),
+                    tickfont=dict(color=axis_text_color),
+                    gridcolor=st.session_state.theme_styles["grid"],
+                    zeroline=False
                 )
             )
-            fig.update_xaxes(tickfont=dict(family="Arial", size=12, color=axis_text_color))
-            fig.update_yaxes(tickfont=dict(family="Arial", size=12, color=axis_text_color))
+
+            # Display chart
             st.plotly_chart(fig, use_container_width=True)
-            st.markdown("""
-            **Bollinger Bands**: Prices near the upper band may indicate overbought conditions; near the lower band, oversold.
-            **MACD**: MACD line crossing above the Signal line is bullish; below is bearish.
-            """)
+
+            # Explanations
+            st.markdown("**Bollinger Bands**: When the price approaches the upper band, it may indicate overbought conditions. Near the lower band suggests oversold conditions.")
+            st.markdown("**MACD**: A bullish signal occurs when the MACD crosses above the signal line. A bearish signal occurs when it crosses below.")
+
         else:
-            st.warning(f"Could not fetch price history for technical indicators.")
-# Technical indicators (RSI)
+            st.warning(f"Could not fetch price history for technical indicators: {error}")
+
+
+# Technical Indicators (RSI)
 st.subheader("📉 Technical Indicators")
 if selected_time_frame in ["1D", "1W"]:
     st.warning("Note: RSI may be less reliable for very short time frames.")
 if stock_ticker:
     with st.spinner(f"Calculating RSI..."):
-        hist = get_stock_history(stock_ticker, period=selected_period)
+        hist, error = get_stock_history(stock_ticker, period=selected_period)
         if hist is not None and not hist.empty:
             delta = hist["Close"].diff()
             gain = delta.where(delta > 0, 0)
@@ -374,41 +1126,69 @@ if stock_ticker:
             else:
                 st.warning("Could not calculate RSI (insufficient data).")
         else:
-            st.warning(f"Could not fetch price history for RSI.")
+            st.warning(f"Could not fetch price history for RSI: {error}")
 
 # Valuation Section
 st.subheader("💰 Valuation")
-st.markdown("""
-Estimate the fair value of the stock using multiple valuation methods. Each method calculates an **Intrinsic Value per Share**, which you can compare to the current market price to assess whether the stock is undervalued or overvalued.
-""")
+st.markdown("Estimate the fair value of the stock using multiple valuation methods.")
 if stock_ticker:
     with st.spinner("Calculating valuations..."):
+        stock_info, error = get_stock_info(stock_ticker)
         stock = yf.Ticker(stock_ticker)
-        stock_info = get_stock_info(stock_ticker)
         try:
             balance_sheet = stock.balance_sheet
             cash_flow = stock.cashflow
-        except:
+            financials = stock.financials
+        except Exception as e:
+            logger.error(f"Failed to fetch financial statements for {stock_ticker}: {str(e)}")
             balance_sheet = None
             cash_flow = None
+            financials = None
             st.warning(f"Could not fetch financial statements for {stock_ticker}.")
         if stock_info:
-            current_price = stock_info.get("regularMarketPrice", stock_info.get("regularMarketPreviousClose", 0))
-            eps = stock_info.get("trailingEps")
-            forward_eps = stock_info.get("forwardEps", eps)
-            shares_outstanding = stock_info.get("sharesOutstanding")
-            book_value = stock_info.get("bookValue")
-            dividend_rate = stock_info.get("dividendRate")
-            five_year_avg_dividend = stock_info.get("fiveYearAvgDividendYield", 0) / 100 if stock_info.get("fiveYearAvgDividendYield") else 0
-            pe_ratio = stock_info.get("trailingPE")
-            growth_rate = min(stock_info.get("earningsGrowth", 0.20), 0.25)
-            beta = stock_info.get("beta", 1.0)
+            current_price = float(stock_info.get("PreviousClose", stock_info.get("regularMarketPrice", stock_info.get("regularMarketPreviousClose", 0))))
+            eps = float(stock_info.get("EPS", stock_info.get("trailingEps", 0)))
+            forward_eps = float(stock_info.get("ForwardEPS", stock_info.get("forwardEps", eps)))
+            shares_outstanding = int(stock_info.get("SharesOutstanding", stock_info.get("sharesOutstanding", 0)))
+            book_value = float(stock_info.get("BookValue", stock_info.get("bookValue", 0)))
+            dividend_rate = float(stock_info.get("DividendRate", stock_info.get("dividendRate", 0)))
+            five_year_avg_dividend = float(stock_info.get("FiveYearAvgDividendYield", stock_info.get("fiveYearAvgDividendYield", 0))) / 100
+            pe_ratio = float(stock_info.get("PERatio", stock_info.get("trailingPE", 0)))
+            growth_rate = min(float(stock_info.get("EarningsGrowth", stock_info.get("earningsGrowth", 0.20))), 0.25)
+            beta = float(stock_info.get("Beta", stock_info.get("beta", 1.0)))
             discount_rate = 0.05 + beta * 0.02
             perpetual_growth = 0.03
-            total_debt = stock_info.get("totalDebt", 0)
-            total_cash = stock_info.get("totalCash", 0)
+            total_debt = float(stock_info.get("TotalDebt", stock_info.get("totalDebt", 0)))
+            total_cash = float(stock_info.get("TotalCash", stock_info.get("totalCash", 0)))
+            revenue = float(stock_info.get("RevenueTTM", stock_info.get("totalRevenue", 0)))
             valuations = []
             calculation_details = []
+            # Intrinsic Value (Simple EPS Multiplier)
+            try:
+                intrinsic_value = eps * 15
+                intrinsic_value = f"${intrinsic_value:.2f}" if isinstance(intrinsic_value, (int, float)) else "N/A"
+                calc = f"""
+                **Intrinsic Value (EPS Multiplier)** 📊
+                - **Formula**: EPS × 15
+                - **EPS**: ${eps:.2f}
+                - **Multiplier**: 15 (a conservative average P/E ratio)
+                - **Calculation**: ${eps:.2f} × 15 = {intrinsic_value}
+                - **Result**: {intrinsic_value} per share
+                **Explanation**: This method multiplies the earnings per share by a standard P/E ratio to estimate a fair value. It’s simple but doesn’t account for growth or risk.
+                """
+                valuations.append({
+                    "Method": "Intrinsic Value (EPS Multiplier)",
+                    "Intrinsic Value per Share": intrinsic_value,
+                    "Description": "EPS multiplied by 15."
+                })
+                calculation_details.append(("Intrinsic Value (EPS Multiplier)", calc))
+            except:
+                valuations.append({
+                    "Method": "Intrinsic Value (EPS Multiplier)",
+                    "Intrinsic Value per Share": "N/A",
+                    "Description": "EPS multiplied by 15."
+                })
+                calculation_details.append(("Intrinsic Value (EPS Multiplier)", "**Why It’s Missing** 🚫\nError in calculation: EPS data unavailable or invalid."))
             # DCF
             try:
                 if cash_flow is not None and not cash_flow.empty and forward_eps and shares_outstanding:
@@ -424,35 +1204,34 @@ if stock_ticker:
                     dcf_value = equity_value / shares_outstanding
                     dcf_value = f"${dcf_value:.2f}" if isinstance(dcf_value, (int, float)) else "N/A"
                     calc = f"""
-                    **What We Did** 📊
-                    We estimate future cash flows and discount them to today’s value.
-                    - **Starting Point**: Free Cash Flow = ${fcf:,.2f}
-                    - **Growth**: {growth_rate*100:.1f}% initially, tapering over 5 years
-                    - **Yearly Cash Flows**: {', '.join([f'${cf:,.2f}' for cf in cash_flows])}
-                    - **Terminal Value**: ${terminal_value:,.2f}
-                    - **Discounted Value**: ${sum(pv_cash_flows):,.2f}
-                    - **Equity Value**: ${enterprise_value:,.2f} - ${net_debt:,.2f} = ${equity_value:,.2f}
-                    - **Per Share**: ${equity_value:,.2f} ÷ {shares_outstanding:,} = {dcf_value}
+                    **Discounted Cash Flow (DCF)** 📊
+                    - **Formula**: Sum of discounted future cash flows + terminal value, adjusted for net debt
+                    - **Free Cash Flow (Year 0)**: ${fcf:,.2f} (estimated as 60% of Forward EPS × Shares Outstanding)
+                    - **Growth Rates (Years 1-5)**: {[f"{g*100:.1f}%" for g in growth_rates]}
+                    - **Discount Rate**: {discount_rate*100:.1f}% (calculated as 5% risk-free rate + Beta × 2%)
+                    - **Terminal Value**: ${terminal_value:,.2f} (using perpetual growth rate of {perpetual_growth*100:.1f}%)
+                    - **Enterprise Value**: ${enterprise_value:,.2f}
+                    - **Net Debt**: ${net_debt:,.2f} (Total Debt - Total Cash)
+                    - **Equity Value**: ${equity_value:,.2f}
+                    - **Per Share**: ${dcf_value:.2f} (${equity_value:,.2f} ÷ {shares_outstanding:,} shares)
+                    **Explanation**: DCF discounts projected future cash flows to present value, accounting for growth, risk, and debt. It’s detailed but sensitive to assumptions.
                     """
                 else:
                     dcf_value = "N/A"
-                    calc = "**Why It’s Missing** 🚫\nWe need cash flow or earnings data."
+                    calc = "**Why It’s Missing** 🚫\nNo cash flow data or missing Forward EPS/Shares Outstanding."
                 valuations.append({
                     "Method": "Discounted Cash Flow (DCF)",
                     "Intrinsic Value per Share": dcf_value,
-                    "Description": "Discounts future cash flows.",
-                 
-                    "Pros and Cons": "✅ Growth firms (e.g., AAPL).\n❌ Volatile cash flows (e.g., startups)."
+                    "Description": "Discounts future cash flows."
                 })
                 calculation_details.append(("Discounted Cash Flow (DCF)", calc))
-            except Exception as e:
+            except:
                 valuations.append({
                     "Method": "Discounted Cash Flow (DCF)",
                     "Intrinsic Value per Share": "N/A",
-                    "Description": "Discounts future cash flows.",
-                    "Pros and Cons": "✅ Growth firms (e.g., AAPL).\n❌ Volatile cash flows (e.g., startups)."
+                    "Description": "Discounts future cash flows."
                 })
-                calculation_details.append(("Discounted Cash Flow (DCF)", f"**Why It’s Missing** 🚫\nError: {str(e)}."))
+                calculation_details.append(("Discounted Cash Flow (DCF)", "**Why It’s Missing** 🚫\nError in calculation: Data unavailable or invalid."))
             # DDM
             try:
                 if dividend_rate and dividend_rate > 0 and forward_eps:
@@ -460,32 +1239,32 @@ if stock_ticker:
                     ddm_value = expected_dividend / (discount_rate - perpetual_growth)
                     ddm_value = f"${ddm_value:.2f}" if isinstance(ddm_value, (int, float)) else "N/A"
                     calc = f"""
-                    **What We Did** 📊
-                    We value the stock based on future dividends.
-                    - **Starting Point**: Dividend = ${dividend_rate:.2f}
-                    - **Growth**: 10% annually
-                    - **Expected Dividend**: ${dividend_rate:.2f} × (1 + 10%) = ${expected_dividend:.2f}
-                    - **Discount Rate**: {discount_rate*100:.1f}%, Long-Term Growth: 3%
-                    - **Per Share**: ${expected_dividend:.2f} ÷ ({discount_rate*100:.1f}% - 3%) = {ddm_value}
+                    **Dividend Discount Model (DDM)** 📊
+                    - **Formula**: Expected Dividend ÷ (Discount Rate - Growth Rate)
+                    - **Current Dividend**: ${dividend_rate:.2f}
+                    - **Expected Dividend**: ${expected_dividend:.2f} (assumes 10% dividend growth)
+                    - **Discount Rate**: {discount_rate*100:.1f}%
+                    - **Perpetual Growth Rate**: {perpetual_growth*100:.1f}%
+                    - **Calculation**: ${expected_dividend:.2f} ÷ ({discount_rate*100:.1f}% - {perpetual_growth*100:.1f}%) = {ddm_value}
+                    - **Result**: {ddm_value} per share
+                    **Explanation**: DDM values the stock based on the present value of future dividends, assuming constant growth. Best for dividend-paying stocks.
                     """
                 else:
                     ddm_value = "N/A"
-                    calc = "**Why It’s Missing** 🚫\nNo dividends or data."
+                    calc = "**Why It’s Missing** 🚫\nNo dividend data or invalid Forward EPS."
                 valuations.append({
                     "Method": "Dividend Discount Model (DDM)",
                     "Intrinsic Value per Share": ddm_value,
-                    "Description": "Values stock via dividends.",
-                    "Pros and Cons": "✅ Dividend stocks (e.g., PG).\n❌ Non-dividend stocks (e.g., TSLA)."
+                    "Description": "Values stock via dividends."
                 })
                 calculation_details.append(("Dividend Discount Model (DDM)", calc))
-            except Exception as e:
+            except:
                 valuations.append({
                     "Method": "Dividend Discount Model (DDM)",
                     "Intrinsic Value per Share": "N/A",
-                    "Description": "Values stock via dividends.",
-                    "Pros and Cons": "✅ Dividend stocks (e.g., PG).\n❌ Non-dividend stocks (e.g., TSLA)."
+                    "Description": "Values stock via dividends."
                 })
-                calculation_details.append(("Dividend Discount Model (DDM)", f"**Why It’s Missing** 🚫\nError: {str(e)}."))
+                calculation_details.append(("Dividend Discount Model (DDM)", "**Why It’s Missing** 🚫\nError in calculation: Data unavailable or invalid."))
             # RIM
             try:
                 if book_value and forward_eps and shares_outstanding:
@@ -495,174 +1274,111 @@ if stock_ticker:
                     rim_value = book_value + (residual_income * retention_ratio * (1 + growth_rate) / (discount_rate - perpetual_growth))
                     rim_value = f"${rim_value:.2f}" if isinstance(rim_value, (int, float)) else "N/A"
                     calc = f"""
-                    **What We Did** 📊
-                    We combine book value with excess earnings.
-                    - **Starting Point**: Book Value = ${book_value:.2f}, EPS = ${forward_eps:.2f}
-                    - **Retention**: {retention_ratio*100:.1f}%
-                    - **Residual Income**: ${forward_eps:.2f} - ({discount_rate*100:.1f}% × ${book_value:.2f}) = ${residual_income:.2f}
-                    - **Growth**: {growth_rate*100:.1f}%
-                    - **Per Share**: ${book_value:.2f} + ${(residual_income * retention_ratio * (1 + growth_rate) / (discount_rate - perpetual_growth)):.2f} = {rim_value}
+                    **Residual Income Model (RIM)** 📊
+                    - **Formula**: Book Value + (Residual Income × Retention Ratio × (1 + Growth Rate)) ÷ (Discount Rate - Growth Rate)
+                    - **Book Value per Share**: ${book_value:.2f}
+                    - **Forward EPS**: ${forward_eps:.2f}
+                    - **ROE**: {roe*100:.1f}% (Forward EPS ÷ Book Value)
+                    - **Retention Ratio**: {retention_ratio:.2f} (1 - Dividend Payout Ratio)
+                    - **Residual Income**: ${residual_income:.2f} (Forward EPS - (Discount Rate × Book Value))
+                    - **Growth Rate**: {growth_rate*100:.1f}%
+                    - **Discount Rate**: {discount_rate*100:.1f}%
+                    - **Perpetual Growth Rate**: {perpetual_growth*100:.1f}%
+                    - **Calculation**: ${book_value:.2f} + (${residual_income:.2f} × {retention_ratio:.2f} × (1 + {growth_rate:.2f})) ÷ ({discount_rate*100:.1f}% - {perpetual_growth*100:.1f}%) = {rim_value}
+                    - **Result**: {rim_value} per share
+                    **Explanation**: RIM adds the present value of residual income (earnings above required return) to book value. It’s useful for companies with significant book value.
                     """
                 else:
                     rim_value = "N/A"
-                    calc = "**Why It’s Missing** 🚫\nNo book value or EPS."
+                    calc = "**Why It’s Missing** 🚫\nNo book value, Forward EPS, or Shares Outstanding data."
                 valuations.append({
                     "Method": "Residual Income Model (RIM)",
                     "Intrinsic Value per Share": rim_value,
-                    "Description": "Uses book value and income.",
-                    "Pros and Cons": "✅ Strong book value (e.g., JPM).\n❌ Low book value (e.g., tech startups)."
+                    "Description": "Uses book value and income."
                 })
                 calculation_details.append(("Residual Income Model (RIM)", calc))
-            except Exception as e:
+            except:
                 valuations.append({
                     "Method": "Residual Income Model (RIM)",
                     "Intrinsic Value per Share": "N/A",
-                    "Description": "Uses book value and income.",
-                    "Pros and Cons": "✅ Strong book value (e.g., JPM).\n❌ Low book value (e.g., tech startups)."
+                    "Description": "Uses book value and income."
                 })
-                calculation_details.append(("Residual Income Model (RIM)", f"**Why It’s Missing** 🚫\nError: {str(e)}."))
-            # Asset-Based
-            try:
-                if balance_sheet is not None and not balance_sheet.empty and shares_outstanding:
-                    total_assets = balance_sheet.loc["Total Assets"].iloc[0] if "Total Assets" in balance_sheet.index else 0
-                    total_liabilities = balance_sheet.loc["Total Liabilities Net Minority Interest"].iloc[0] if "Total Liabilities Net Minority Interest" in balance_sheet.index else 0
-                    net_assets = total_assets - total_liabilities
-                    asset_value = (net_assets / shares_outstanding) * 1.5
-                    asset_value = f"${asset_value:.2f}" if isinstance(asset_value, (int, float)) else "N/A"
-                    calc = f"""
-                    **What We Did** 📊
-                    We calculate net assets with a premium.
-                    - **Starting Point**: Assets = ${total_assets:,.2f}, Liabilities = ${total_liabilities:,.2f}
-                    - **Net Assets**: ${total_assets:,.2f} - ${total_liabilities:,.2f} = ${net_assets:,.2f}
-                    - **Premium**: 1.5x
-                    - **Per Share**: ${net_assets:,.2f} × 1.5 ÷ {shares_outstanding:,} = {asset_value}
-                    """
-                else:
-                    asset_value = "N/A"
-                    calc = "**Why It’s Missing** 🚫\nNo balance sheet data."
-                valuations.append({
-                    "Method": "Asset-Based Valuation",
-                    "Intrinsic Value per Share": asset_value,
-                    "Description": "Net assets with premium.",
-                    "Pros and Cons": "✅ Asset-heavy firms (e.g., REITs).\n❌ High-debt firms (e.g., tech)."
-                })
-                calculation_details.append(("Asset-Based Valuation", calc))
-            except Exception as e:
-                valuations.append({
-                    "Method": "Asset-Based Valuation",
-                    "Intrinsic Value per Share": "N/A",
-                    "Description": "Net assets with premium.",
-                    "Pros and Cons": "✅ Asset-heavy firms (e.g., REITs).\n❌ High-debt firms (e.g., tech)."
-                })
-                calculation_details.append(("Asset-Based Valuation", f"**Why It’s Missing** 🚫\nError: {str(e)}."))
-            # EPV
-            try:
-                if forward_eps:
-                    normalized_earnings = forward_eps * (1 - five_year_avg_dividend)
-                    epv_value = normalized_earnings / (discount_rate - 0.015)
-                    epv_value = f"${epv_value:.2f}" if isinstance(epv_value, (int, float)) else "N/A"
-                    calc = f"""
-                    **What We Did** 📊
-                    We estimate sustainable earnings.
-                    - **Starting Point**: EPS = ${forward_eps:.2f}, Dividend Yield = {five_year_avg_dividend*100:.1f}%
-                    - **Earnings**: ${forward_eps:.2f} × (1 - {five_year_avg_dividend:.2f}) = ${normalized_earnings:.2f}
-                    - **Discount Rate**: {discount_rate*100:.1f}% - 1.5%
-                    - **Per Share**: ${normalized_earnings:.2f} ÷ {(discount_rate - 0.015)*100:.1f}% = {epv_value}
-                    """
-                else:
-                    epv_value = "N/A"
-                    calc = "**Why It’s Missing** 🚫\nNo EPS data."
-                valuations.append({
-                    "Method": "Earnings Power Value (EPV)",
-                    "Intrinsic Value per Share": epv_value,
-                    "Description": "Sustainable earnings value.",
-                    "Pros and Cons": "✅ Stable earnings (e.g., staples).\n❌ Cyclical firms (e.g., airlines)."
-                })
-                calculation_details.append(("Earnings Power Value (EPV)", calc))
-            except Exception as e:
-                valuations.append({
-                    "Method": "Earnings Power Value (EPV)",
-                    "Intrinsic Value per Share": "N/A",
-                    "Description": "Sustainable earnings value.",
-                    "Pros and Cons": "✅ Stable earnings (e.g., staples).\n❌ Cyclical firms (e.g., airlines)."
-                })
-                calculation_details.append(("Earnings Power Value (EPV)", f"**Why It’s Missing** 🚫\nError: {str(e)}."))
+                calculation_details.append(("Residual Income Model (RIM)", "**Why It’s Missing** 🚫\nError in calculation: Data unavailable or invalid."))
             # Graham
             try:
                 if forward_eps and growth_rate:
                     graham_value = forward_eps * (10 + 2.5 * growth_rate * 100)
                     graham_value = f"${graham_value:.2f}" if isinstance(graham_value, (int, float)) else "N/A"
                     calc = f"""
-                    **What We Did** 📊
-                    We use a formula based on earnings and growth.
-                    - **Starting Point**: EPS = ${forward_eps:.2f}, Growth = {growth_rate*100:.1f}%
-                    - **Multiplier**: 10 + 2.5 × {growth_rate*100:.1f} = {(10 + 2.5 * growth_rate * 100):.1f}
-                    - **Per Share**: ${forward_eps:.2f} × {(10 + 2.5 * growth_rate * 100):.1f} = {graham_value}
+                    **Graham Method** 📊
+                    - **Formula**: Forward EPS × (10 + 2.5 × Growth Rate × 100)
+                    - **Forward EPS**: ${forward_eps:.2f}
+                    - **Growth Rate**: {growth_rate*100:.1f}%
+                    - **Multiplier**: 10 + 2.5 × {growth_rate*100:.1f} = {10 + 2.5 * growth_rate * 100:.1f}
+                    - **Calculation**: ${forward_eps:.2f} × {10 + 2.5 * growth_rate * 100:.1f} = {graham_value}
+                    - **Result**: {graham_value} per share
+                    **Explanation**: The Graham Method adjusts the P/E ratio based on growth, inspired by Benjamin Graham’s value investing principles.
                     """
                 else:
                     graham_value = "N/A"
-                    calc = "**Why It’s Missing** 🚫\nNo EPS or growth data."
+                    calc = "**Why It’s Missing** 🚫\nNo Forward EPS or growth rate data."
                 valuations.append({
                     "Method": "Graham Method",
                     "Intrinsic Value per Share": graham_value,
-                    "Description": "EPS with growth multiplier.",
-                    "Pros and Cons": "✅ Value stocks (e.g., KO).\n❌ High-growth stocks (e.g., NVDA)."
+                    "Description": "EPS with growth multiplier."
                 })
                 calculation_details.append(("Graham Method", calc))
-            except Exception as e:
+            except:
                 valuations.append({
                     "Method": "Graham Method",
                     "Intrinsic Value per Share": "N/A",
-                    "Description": "EPS with growth multiplier.",
-                    "Pros and Cons": "✅ Value stocks (e.g., KO).\n❌ High-growth stocks (e.g., NVDA)."
+                    "Description": "EPS with growth multiplier."
                 })
-                calculation_details.append(("Graham Method", f"**Why It’s Missing** 🚫\nError: {str(e)}."))
-            # PEG
+                calculation_details.append(("Graham Method", "**Why It’s Missing** 🚫\nError in calculation: Data unavailable or invalid."))
+            # Comps (using P/E and P/S)
             try:
-                if pe_ratio and growth_rate and growth_rate != 0:
-                    peg = pe_ratio / (growth_rate * 100)
-                    if peg <= 1:
-                        peg_value = current_price * 1.5
-                    else:
-                        peg_value = current_price / (peg * 0.7)
-                    peg_value = f"${peg_value:.2f}" if isinstance(peg_value, (int, float)) else "N/A"
+                if pe_ratio and revenue and shares_outstanding:
+                    industry_pe = 25.0  # Static average for simplicity
+                    comps_pe_value = eps * industry_pe
+                    industry_ps = 5.0  # Static average for simplicity
+                    comps_ps_value = (revenue * industry_ps) / shares_outstanding
+                    comps_value = (comps_pe_value + comps_ps_value) / 2
+                    comps_value = f"${comps_value:.2f}" if isinstance(comps_value, (int, float)) else "N/A"
                     calc = f"""
-                    **What We Did** 📊
-                    We adjust P/E based on growth.
-                    - **Starting Point**: P/E = {pe_ratio:.2f}, Growth = {growth_rate*100:.1f}%, Price = ${current_price:.2f}
-                    - **PEG**: {pe_ratio:.2f} ÷ {growth_rate*100:.1f} = {peg:.2f}
-                    - **Per Share**: {'${:.2f} × 1.5 = {}'.format(current_price, peg_value) if peg <= 1 else '${:.2f} ÷ ({:.2f} × 0.7) = {}'.format(current_price, peg, peg_value)}
+                    **Comparable Company Analysis (Comps)** 📊
+                    - **Formula**: Average of (EPS × Industry P/E) and (Revenue × Industry P/S ÷ Shares Outstanding)
+                    - **EPS**: ${eps:.2f}
+                    - **Industry P/E**: {industry_pe:.1f}
+                    - **P/E Value**: ${comps_pe_value:.2f} (EPS × Industry P/E)
+                    - **Revenue**: ${revenue:,.2f}
+                    - **Industry P/S**: {industry_ps:.1f}
+                    - **Shares Outstanding**: {shares_outstanding:,}
+                    - **P/S Value**: ${comps_ps_value:.2f} (Revenue × Industry P/S ÷ Shares Outstanding)
+                    - **Average Value**: (${comps_pe_value:.2f} + ${comps_ps_value:.2f}) ÷ 2 = {comps_value}
+                    - **Result**: {comps_value} per share
+                    **Explanation**: Comps uses industry averages (P/E and P/S ratios) to estimate value relative to similar companies.
                     """
                 else:
-                    peg_value = "N/A"
-                    calc = "**Why It’s Missing** 🚫\nNo P/E or growth data."
+                    comps_value = "N/A"
+                    calc = "**Why It’s Missing** 🚫\nNo P/E, revenue, or shares outstanding data."
                 valuations.append({
-                    "Method": "PEG Ratio",
-                    "Intrinsic Value per Share": peg_value,
-                    "Description": "P/E adjusted for growth.",
-                    "Pros and Cons": "✅ Growth stocks (e.g., AMZN).\n❌ Low-growth firms (e.g., utilities)."
+                    "Method": "Comparable Company Analysis (Comps)",
+                    "Intrinsic Value per Share": comps_value,
+                    "Description": "Uses industry P/E and P/S ratios."
                 })
-                calculation_details.append(("PEG Ratio", calc))
-            except Exception as e:
+                calculation_details.append(("Comparable Company Analysis (Comps)", calc))
+            except:
                 valuations.append({
-                    "Method": "PEG Ratio",
+                    "Method": "Comparable Company Analysis (Comps)",
                     "Intrinsic Value per Share": "N/A",
-                    "Description": "P/E adjusted for growth.",
-                    "Pros and Cons": "✅ Growth stocks (e.g., AMZN).\n❌ Low-growth firms (e.g., utilities)."
+                    "Description": "Uses industry P/E and P/S ratios."
                 })
-                calculation_details.append(("PEG Ratio", f"**Why It’s Missing** 🚫\nError: {str(e)}."))
+                calculation_details.append(("Comparable Company Analysis (Comps)", "**Why It’s Missing** 🚫\nError in calculation: Data unavailable or invalid."))
+            # Valuation Table and Chart
             valuation_df = pd.DataFrame(valuations)
             st.markdown(f"**Current Market Price**: ${current_price:.2f}")
             st.markdown("### Valuation Estimates")
-            st.dataframe(
-                valuation_df[["Method", "Intrinsic Value per Share", "Description", "Pros and Cons"]],
-                width=1200,
-                column_config={
-                    "Intrinsic Value per Share": st.column_config.TextColumn(help="Estimated fair price per share."),
-                    "Pros and Cons": st.column_config.TextColumn(help="When to use this method.")
-                }
-            )
-            
+            st.dataframe(valuation_df[["Method", "Intrinsic Value per Share", "Description"]], width=1200)
             st.markdown("### Valuation Comparison Chart")
             chart_data = valuation_df[valuation_df["Intrinsic Value per Share"] != "N/A"]
             if not chart_data.empty:
@@ -670,7 +1386,7 @@ if stock_ticker:
                 intrinsic_values = [float(val.replace("$", "")) for val in chart_data["Intrinsic Value per Share"]]
                 chart_methods = methods + ["Current Price"]
                 chart_values = intrinsic_values + [current_price]
-                axis_text_color = "#000000" if st.session_state.theme == "light" else st.session_state.theme_styles['text']
+                axis_text_color = "#000000" if st.session_state.theme == "light" else "#FFFFFF"
                 fig = go.Figure()
                 fig.add_trace(
                     go.Bar(
@@ -679,7 +1395,7 @@ if stock_ticker:
                         marker_color=st.session_state.theme_styles["bar_colors"][:len(chart_methods)],
                         text=[f"${v:.2f}" for v in chart_values],
                         textposition="auto",
-                        hovertemplate="%{x}: $%{y:.2f}<extra></extra>"
+                        textfont=dict(color=axis_text_color)
                     )
                 )
                 fig.add_hline(
@@ -688,146 +1404,168 @@ if stock_ticker:
                     line_color=st.session_state.theme_styles["bar_colors"][-1],
                     annotation_text="Current Price",
                     annotation_position="top right",
-                    annotation_font=dict(size=12, color=st.session_state.theme_styles["text"])
+                    annotation_font=dict(color=axis_text_color)
                 )
                 fig.update_layout(
-                    title=dict(text=f"{stock_ticker} Intrinsic Value vs. Current Price", font=dict(color=st.session_state.theme_styles["text"])),
+                    title=dict(
+                        text=f"{stock_ticker} Intrinsic Value vs. Current Price",
+                        font=dict(size=20, color=axis_text_color),
+                        x=0.5,
+                        xanchor="center"
+                    ),
                     xaxis_title="Valuation Method",
                     yaxis_title="Price per Share (USD)",
                     showlegend=False,
-                    legend=dict(font=dict(color=axis_text_color)),
                     plot_bgcolor=st.session_state.theme_styles["plot_bg"],
-                    paper_bgcolor=st.session_state.theme_styles["bg"],
+                    paper_bgcolor="rgba(0,0,0,0)",
                     font=dict(family="Arial", size=14, color=axis_text_color),
                     height=500,
-                    margin=dict(l=50, r=50, t=80, b=50),
                     xaxis=dict(
-                        title=dict(font=dict(color=axis_text_color)),
-                        tickfont=dict(family="Arial", size=14, color=axis_text_color),
+                        title=dict(text="Valuation Method", font=dict(color=axis_text_color, size=14)),
+                        tickfont=dict(family="Arial", size=12, color=axis_text_color),
                         tickangle=45,
-                        gridcolor=st.session_state.theme_styles["grid"]
+                        gridcolor=st.session_state.theme_styles["grid"],
+                        zeroline=False
                     ),
                     yaxis=dict(
-                        title=dict(font=dict(color=axis_text_color)),
-                        tickfont=dict(family="Arial", size=14, color=axis_text_color),
-                        gridcolor=st.session_state.theme_styles["grid"]
-                    )
+                        title=dict(text="Price per Share (USD)", font=dict(color=axis_text_color, size=14)),
+                        tickfont=dict(family="Arial", size=12, color=axis_text_color),
+                        gridcolor=st.session_state.theme_styles["grid"],
+                        zeroline=False
+                    ),
+                    margin=dict(l=50, r=50, t=80, b=50)
                 )
-                fig.update_xaxes(tickfont=dict(family="Arial", size=14, color=axis_text_color))
-                fig.update_yaxes(tickfont=dict(family="Arial", size=14, color=axis_text_color))
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.warning("Insufficient data for valuation chart.")
             st.markdown("### How Intrinsic Values Are Calculated")
-            st.markdown("Click to expand each method for a step-by-step breakdown.")
             for method, calc in calculation_details:
                 with st.expander(f"{method} Calculation"):
                     st.markdown(f'<span class="calc-header">{method}</span>', unsafe_allow_html=True)
                     st.markdown(calc)
         else:
-            st.warning("Could not fetch data for valuations.")
+            st.warning(f"Could not fetch data for valuations: {error}")
 
 # Learning Section
 st.subheader("📚 Learn")
-st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Test your investing knowledge with interactive quizzes.</p>', unsafe_allow_html=True)
-quiz_level = st.selectbox("Select Quiz Level:", ["Beginner", "Intermediate", "Expert"])
+st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Test your investing knowledge with interactive quizzes and games.</p>', unsafe_allow_html=True)
 
-# Enhanced CSS to fix gray font and style buttons
-st.markdown(f"""
-<style>
-    .stRadio [role="radio"] label, .stRadio [role="radio"] label p, .stRadio [role="radio"] div p {{
-        color: {st.session_state.theme_styles['text']} !important;
-        opacity: 1 !important;
-    }}
-    .stRadio > label, .stRadio > label p, .stRadio > div p {{
-        color: {st.session_state.theme_styles['text']} !important;
-        opacity: 1 !important;
-    }}
-    .stAlert > div, .stAlert > div p {{
-        color: {st.session_state.theme_styles['text']} !important;
-        opacity: 1 !important;
-    }}
-    .stMarkdown, .stMarkdown p {{
-        color: {st.session_state.theme_styles['text']} !important;
-        opacity: 1 !important;
-    }}
-    [data-testid="stSelectbox"] label, [data-testid="stSelectbox"] div p {{
-        color: {st.session_state.theme_styles['text']} !important;
-        opacity: 1 !important;
-    }}
-    button[kind="secondary"] {{
-        background-color: {st.session_state.theme_styles['bar_colors'][3]} !important;
-        color: {st.session_state.theme_styles['text']} !important;
-        border: 1px solid {st.session_state.theme_styles['text']} !important;
-        border-radius: 5px !important;
-        padding: 8px 16px !important;
-        opacity: 1 !important;
-    }}
-    button[kind="secondary"]:hover {{
-        background-color: {st.session_state.theme_styles['bar_colors'][0]} !important;
-        color: {st.session_state.theme_styles['text']} !important;
-        opacity: 1 !important;
-    }}
-</style>
-""", unsafe_allow_html=True)
+# Quiz Section
+quiz_level = st.selectbox("Select Quiz Level:", ["Beginner", "Intermediate", "Expert"])
 
 quizzes = {
     "Beginner": [
-        {"question": "What is a stock?", "options": ["A loan to a company", "Ownership in a company", "A type of bond"], "answer": "Ownership in a company"},
-        {"question": "What does P/E ratio measure?", "options": ["Profit margin", "Price per earnings", "Portfolio value"], "answer": "Price per earnings"},
-        {"question": "What is a dividend?", "options": ["A loan repayment", "A share of profits paid to shareholders", "A stock split"], "answer": "A share of profits paid to shareholders"},
-        {"question": "What is a stock market?", "options": ["A place to buy bonds", "A marketplace for trading company shares", "A savings account"], "answer": "A marketplace for trading company shares"},
-        {"question": "What is a bull market?", "options": ["Falling prices", "Rising prices", "Stable prices"], "answer": "Rising prices"},
-        {"question": "What is a bear market?", "options": ["Rising prices", "Falling prices", "Neutral market"], "answer": "Falling prices"},
-        {"question": "What does diversification mean?", "options": ["Investing in one stock", "Spreading investments across assets", "Selling all stocks"], "answer": "Spreading investments across assets"},
-        {"question": "What is a blue-chip stock?", "options": ["A new company stock", "A stable, large company stock", "A risky stock"], "answer": "A stable, large company stock"},
-        {"question": "What is the S&P 500?", "options": ["A stock price", "An index of 500 large companies", "A type of bond"], "answer": "An index of 500 large companies"},
-        {"question": "What is a brokerage account?", "options": ["A savings account", "An account to buy/sell securities", "A retirement fund"], "answer": "An account to buy/sell securities"}
+        {"question": "What is a stock?", "options": ["A loan to a company", "Ownership in a company", "A type of bond", "A government security"], "answer": "Ownership in a company"},
+        {"question": "What does P/E ratio measure?", "options": ["Profit margin", "Price per earnings", "Portfolio value", "Price per equity"], "answer": "Price per earnings"},
+        {"question": "What is a dividend?", "options": ["A loan repayment", "A share of profits paid to shareholders", "A stock split", "A tax credit"], "answer": "A share of profits paid to shareholders"},
+        {"question": "What is a bull market?", "options": ["Falling prices", "Rising prices", "Stable prices", "No trading"], "answer": "Rising prices"},
+        {"question": "What does market cap represent?", "options": ["Company's total debt", "Total value of shares", "Annual revenue", "Dividend payout"], "answer": "Total value of shares"},
+        {"question": "What is a bear market?", "options": ["Rising prices", "Falling prices", "Stable prices", "High volatility"], "answer": "Falling prices"},
+        {"question": "What does EPS stand for?", "options": ["Equity Price Standard", "Earnings Per Share", "Economic Profit System", "Exchange Price System"], "answer": "Earnings Per Share"},
+        {"question": "What is the stock market?", "options": ["A place to buy groceries", "A platform to trade company shares", "A type of bank", "A government agency"], "answer": "A platform to trade company shares"},
+        {"question": "What is a portfolio?", "options": ["A single stock", "A collection of investments", "A type of loan", "A financial report"], "answer": "A collection of investments"},
+        {"question": "What does diversification mean?", "options": ["Investing in one stock", "Spreading investments across assets", "Selling all stocks", "Buying only bonds"], "answer": "Spreading investments across assets"}
     ],
     "Intermediate": [
-        {"question": "What is a golden cross?", "options": ["50-day SMA crossing above 200-day SMA", "A sharp price drop", "A dividend increase"], "answer": "50-day SMA crossing above 200-day SMA"},
-        {"question": "What does RSI above 70 indicate?", "options": ["Oversold", "Overbought", "Neutral"], "answer": "Overbought"},
-        {"question": "What is beta?", "options": ["A measure of debt", "A measure of stock volatility", "A type of option"], "answer": "A measure of stock volatility"},
-        {"question": "What is a death cross?", "options": ["50-day SMA crossing below 200-day SMA", "A sharp price rise", "A stock split"], "answer": "50-day SMA crossing below 200-day SMA"},
-        {"question": "What does MACD stand for?", "options": ["Market Average Daily Change", "Moving Average Convergence Divergence", "Momentum Adjusted Capital Divergence"], "answer": "Moving Average Convergence Divergence"},
-        {"question": "What is a stop-loss order?", "options": ["An order to buy at a higher price", "An order to sell if price drops to a level", "An order to hold a stock"], "answer": "An order to sell if price drops to a level"},
-        {"question": "What is short selling?", "options": ["Buying low, selling high", "Selling borrowed shares to buy back later", "Holding stocks long-term"], "answer": "Selling borrowed shares to buy back later"},
-        {"question": "What does a high P/B ratio indicate?", "options": ["Undervalued stock", "Overvalued stock", "Stable stock"], "answer": "Overvalued stock"},
-        {"question": "What is a market cap?", "options": ["Total debt of a company", "Total value of a company's shares", "Annual revenue"], "answer": "Total value of a company's shares"},
-        {"question": "What is a dividend yield?", "options": ["Annual dividend per share divided by stock price", "Total company profits", "Stock price increase"], "answer": "Annual dividend per share divided by stock price"}
+        {"question": "What is a golden cross?", "options": ["50-day SMA crossing above 200-day SMA", "A sharp price drop", "A dividend increase", "A stock split"], "answer": "50-day SMA crossing above 200-day SMA"},
+        {"question": "What does RSI above 70 indicate?", "options": ["Oversold", "Overbought", "Neutral", "High volume"], "answer": "Overbought"},
+        {"question": "What is beta?", "options": ["A measure of debt", "A measure of stock volatility", "A type of option", "A dividend metric"], "answer": "A measure of stock volatility"},
+        {"question": "What does a high P/B ratio suggest?", "options": ["Undervalued stock", "Overvalued stock", "Low debt", "High dividends"], "answer": "Overvalued stock"},
+        {"question": "What is a death cross?", "options": ["50-day SMA crossing below 200-day SMA", "A stock merger", "A new IPO", "A market crash"], "answer": "50-day SMA crossing below 200-day SMA"},
+        {"question": "What does MACD measure?", "options": ["Market cap", "Momentum and trend changes", "Dividend yield", "Debt ratio"], "answer": "Momentum and trend changes"},
+        {"question": "What is a stop-loss order?", "options": ["A buy order", "An order to sell if price drops", "A dividend reinvestment", "A market prediction"], "answer": "An order to sell if price drops"},
+        {"question": "What does a low beta indicate?", "options": ["High volatility", "Low volatility", "High dividends", "Low earnings"], "answer": "Low volatility"},
+        {"question": "What are Bollinger Bands used for?", "options": ["Measuring earnings", "Identifying overbought/oversold conditions", "Calculating dividends", "Tracking volume"], "answer": "Identifying overbought/oversold conditions"},
+        {"question": "What does ROE measure?", "options": ["Return on Equity", "Revenue over Expenses", "Risk of Earnings", "Return on Exchange"], "answer": "Return on Equity"}
     ],
     "Expert": [
-        {"question": "What is the DCF valuation method?", "options": ["Dividend discount model", "Discounted cash flow", "Debt-to-equity calculation"], "answer": "Discounted cash flow"},
-        {"question": "What does a PEG ratio below 1 suggest?", "options": ["Overvalued stock", "Undervalued stock", "High debt"], "answer": "Undervalued stock"},
-        {"question": "What is the purpose of Bollinger Bands?", "options": ["Measure earnings", "Identify overbought/oversold conditions", "Calculate dividends"], "answer": "Identify overbought/oversold conditions"},
-        {"question": "What is a WACC?", "options": ["Weighted Average Cost of Capital", "Weighted Annual Cash Conversion", "Weighted Asset Capital Cost"], "answer": "Weighted Average Cost of Capital"},
-        {"question": "What does a high Sharpe ratio indicate?", "options": ["High risk", "Better risk-adjusted return", "Low volatility"], "answer": "Better risk-adjusted return"},
-        {"question": "What is a leveraged buyout (LBO)?", "options": ["Buying a company with borrowed funds", "Selling company assets", "Merging two companies"], "answer": "Buying a company with borrowed funds"},
-        {"question": "What is the Efficient Market Hypothesis?", "options": ["Markets are always inefficient", "Stock prices reflect all information", "Markets are predictable"], "answer": "Stock prices reflect all information"},
-        {"question": "What is a Black-Scholes model used for?", "options": ["Valuing bonds", "Pricing options", "Calculating dividends"], "answer": "Pricing options"},
-        {"question": "What does a high alpha indicate?", "options": ["Underperformance", "Outperformance relative to benchmark", "Low risk"], "answer": "Outperformance relative to benchmark"},
-        {"question": "What is a poison pill strategy?", "options": ["A merger tactic", "A defense against hostile takeovers", "A dividend policy"], "answer": "A defense against hostile takeovers"}
+        {"question": "What is the DCF valuation method?", "options": ["Dividend discount model", "Discounted cash flow", "Debt-to-equity calculation", "Direct cost formula"], "answer": "Discounted cash flow"},
+        {"question": "What does a PEG ratio below 1 suggest?", "options": ["Overvalued stock", "Undervalued stock", "High debt", "Low growth"], "answer": "Undervalued stock"},
+        {"question": "What is the purpose of Bollinger Bands?", "options": ["Measure earnings", "Identify overbought/oversold conditions", "Calculate dividends", "Predict taxes"], "answer": "Identify overbought/oversold conditions"},
+        {"question": "What does a high debt/equity ratio indicate?", "options": ["Low risk", "High financial leverage", "High dividends", "Low volatility"], "answer": "High financial leverage"},
+        {"question": "What is intrinsic value?", "options": ["Market price", "True worth of a stock", "Dividend payout", "Trading volume"], "answer": "True worth of a stock"},
+        {"question": "What does a bullish MACD crossover suggest?", "options": ["Sell signal", "Buy signal", "Neutral market", "High volatility"], "answer": "Buy signal"},
+        {"question": "What is the Graham Method?", "options": ["A growth-based valuation", "EPS with growth multiplier", "A debt calculation", "A dividend model"], "answer": "EPS with growth multiplier"},
+        {"question": "What does a high P/S ratio indicate?", "options": ["Undervalued stock", "Overvalued stock", "Low revenue", "High dividends"], "answer": "Overvalued stock"},
+        {"question": "What is a comps valuation?", "options": ["Comparing to industry peers", "Discounting cash flows", "Using dividends", "Calculating book value"], "answer": "Comparing to industry peers"},
+        {"question": "What does a low RSI (below 30) suggest?", "options": ["Overbought", "Oversold", "Neutral", "High volume"], "answer": "Oversold"}
     ]
 }
 
 if quiz_level:
     st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}"><b>{quiz_level} Quiz</b></p>', unsafe_allow_html=True)
+    score = 0
+    total_questions = len(quizzes[quiz_level])
     for i, q in enumerate(quizzes[quiz_level], 1):
         st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}"><b>Question {i}: {q["question"]}</b></p>', unsafe_allow_html=True)
         answer = st.radio(f"Select an answer for question {i}:", q["options"], key=f"quiz_{quiz_level}_{i}")
-        if st.button(f"Check Answer {i}"):
+        if st.button(f"Check Answer {i}", key=f"check_{quiz_level}_{i}"):
             if answer == q["answer"]:
                 st.success("Correct!")
+                score += 1
             else:
                 st.error(f"Incorrect. The answer is: {q['answer']}.")
+    if st.button("Submit Quiz", key=f"submit_{quiz_level}"):
+        st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Your Score: {score}/{total_questions} ({score/total_questions*100:.1f}%)</p>', unsafe_allow_html=True)
+        if score == total_questions:
+            st.success("Perfect score! You're a stock market pro!")
+        elif score >= 7:
+            st.info("Great job! You're learning fast.")
+        else:
+            st.warning("Keep practicing! Try the game below to improve.")
+
+# Learning Game Section
+st.markdown("### Stock Market Challenge Game")
+st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Invest virtual $10,000 by answering questions correctly. Earn or lose based on your choices!</p>', unsafe_allow_html=True)
+
+if "game_balance" not in st.session_state:
+    st.session_state.game_balance = 10000
+if "game_round" not in st.session_state:
+    st.session_state.game_round = 0
+
+game_questions = [
+    {"question": "Should you buy a stock with a P/E ratio of 50? (High P/E may indicate overvaluation)", "options": ["Yes", "No"], "correct": "No", "impact": -500},
+    {"question": "Is a MACD bullish crossover a buy signal?", "options": ["Yes", "No"], "correct": "Yes", "impact": 300},
+    {"question": "Should you invest in a company with negative EPS?", "options": ["Yes", "No"], "correct": "No", "impact": -400},
+    {"question": "Does a high dividend yield always mean a good investment?", "options": ["Yes", "No"], "correct": "No", "impact": -200},
+    {"question": "Is a low beta stock less volatile?", "options": ["Yes", "No"], "correct": "Yes", "impact": 250},
+    {"question": "Should you buy if RSI is above 70?", "options": ["Yes", "No"], "correct": "No", "impact": -300},
+    {"question": "Is a golden cross a bullish signal?", "options": ["Yes", "No"], "correct": "Yes", "impact": 400},
+    {"question": "Does a high P/B ratio suggest undervaluation?", "options": ["Yes", "No"], "correct": "No", "impact": -350},
+    {"question": "Is a stock with a PEG ratio below 1 likely undervalued?", "options": ["Yes", "No"], "correct": "Yes", "impact": 500},
+    {"question": "Should you sell if a death cross occurs?", "options": ["Yes", "No"], "correct": "Yes", "impact": 200}
+]
+
+if st.session_state.game_round < len(game_questions):
+    current_q = game_questions[st.session_state.game_round]
+    st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}"><b>Round {st.session_state.game_round + 1}: {current_q["question"]}</b></p>', unsafe_allow_html=True)
+    user_choice = st.radio("Your choice", current_q["options"], key=f"game_{st.session_state.game_round}")
+    if st.button("Submit Answer", key=f"game_submit_{st.session_state.game_round}"):
+        if user_choice == current_q["correct"]:
+            st.session_state.game_balance += abs(current_q["impact"])  # Gain money for correct answer
+            st.success(f"Correct! You earned ${abs(current_q['impact'])}. New balance: ${st.session_state.game_balance}")
+        else:
+            st.session_state.game_balance -= abs(current_q["impact"])  # Lose money for incorrect answer
+            st.error(f"Wrong! You lost ${abs(current_q['impact'])}. New balance: ${st.session_state.game_balance}")
+        st.session_state.game_round += 1
+else:
+    st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}"><b>Game Over! Final Balance: ${st.session_state.game_balance}</b></p>', unsafe_allow_html=True)
+    if st.session_state.game_balance > 10000:
+        st.success("You beat the market! Great job!")
+    elif st.session_state.game_balance < 10000:
+        st.warning("You lost money. Try the quiz again to improve!")
+    if st.button("Restart Game"):
+        st.session_state.game_balance = 10000
+        st.session_state.game_round = 0
 # Portfolio
 st.subheader("💼 Portfolio")
 st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Track your investments and analyze sentiment.</p>', unsafe_allow_html=True)
 
-# Fetch sentiment for a ticker
+@retry_with_backoff
 def get_sentiment(ticker):
     cache_key = f"sentiment_{ticker}"
     if cache_key not in st.session_state.cache:
+        logger.info(f"Fetching sentiment for {ticker}")
         try:
             subreddits = ["wallstreetbets", "stocks"]
             posts = []
@@ -842,67 +1580,50 @@ def get_sentiment(ticker):
                 st.session_state.cache[cache_key] = f"{sentiment} ({avg_score:.2f})"
             else:
                 st.session_state.cache[cache_key] = "N/A"
-        except:
+        except Exception as e:
+            logger.error(f"Failed to fetch sentiment for {ticker}: {str(e)}")
             st.session_state.cache[cache_key] = "N/A"
     return st.session_state.cache[cache_key]
 
-# Portfolio input
 portfolio_input = st.text_input("Enter tickers (comma-separated, e.g., AAPL,MSFT):", value="AAPL,MSFT").strip().upper()
 shares_input = st.text_input("Enter shares for each ticker (comma-separated, e.g., 100,50):", value="100,50").strip()
+purchase_price_input = st.text_input("Enter purchase price per share for each ticker (comma-separated, e.g., 150.00,300.00):", value="150.00,300.00").strip()
 
-# Add CSS to fix Portfolio Simulator headers
-st.markdown(f"""
-<style>
-    [data-testid="stNumberInput"] label, [data-testid="stNumberInput"] div p {{
-        color: {st.session_state.theme_styles['text']} !important;
-        opacity: 1 !important;
-    }}
-    [data-testid="stSlider"] label, [data-testid="stSlider"] div p {{
-        color: {st.session_state.theme_styles['text']} !important;
-        opacity: 1 !important;
-    }}
-</style>
-""", unsafe_allow_html=True)
-
-if portfolio_input and shares_input:
+if portfolio_input and shares_input and purchase_price_input:
     tickers = [t.strip() for t in portfolio_input.split(",")]
     try:
         shares = [int(s.strip()) for s in shares_input.split(",")]
-        if len(tickers) != len(shares):
-            st.error("Number of tickers must match number of shares.")
+        purchase_prices = [float(p.strip()) for p in purchase_price_input.split(",")]
+        if len(tickers) != len(shares) or len(tickers) != len(purchase_prices):
+            st.error("Number of tickers, shares, and purchase prices must match.")
         else:
             portfolio_data = []
             with st.spinner("Fetching portfolio data..."):
-                for ticker, share in zip(tickers, shares):
-                    stock_info = get_stock_info(ticker)
+                for ticker, share, purchase_price in zip(tickers, shares, purchase_prices):
+                    stock_info, error = get_stock_info(ticker)
                     if stock_info:
-                        price = stock_info.get("regularMarketPrice", stock_info.get("regularMarketPreviousClose", 0))
-                        pe_ratio = stock_info.get("trailingPE", "N/A")
-                        pb_ratio = stock_info.get("priceToBook", "N/A")
+                        current_price = float(stock_info.get("PreviousClose", stock_info.get("regularMarketPrice", stock_info.get("regularMarketPreviousClose", 0))))
+                        pe_ratio = float(stock_info.get("PERatio", stock_info.get("trailingPE", "N/A")))
+                        pb_ratio = float(stock_info.get("PriceToBookRatio", stock_info.get("priceToBook", "N/A")))
                         sentiment = get_sentiment(ticker)
+                        gain_loss = (current_price - purchase_price) * share
                         portfolio_data.append({
                             "Ticker": ticker,
                             "Shares": share,
-                            "Price": f"${price:.2f}",
-                            "Value": f"${price * share:.2f}",
+                            "Purchase Price": f"${purchase_price:.2f}",
+                            "Current Price": f"${current_price:.2f}",
+                            "Value": f"${current_price * share:.2f}",
+                            "Gain/Loss": f"${gain_loss:.2f}",
                             "P/E Ratio": f"{pe_ratio:.2f}" if isinstance(pe_ratio, (int, float)) else pe_ratio,
                             "P/B Ratio": f"{pb_ratio:.2f}" if isinstance(pb_ratio, (int, float)) else pb_ratio,
                             "Sentiment": sentiment
                         })
                     else:
-                        st.warning(f"Could not fetch data for {ticker}.")
+                        st.warning(f"Could not fetch data for {ticker}: {error}")
             if portfolio_data:
                 st.markdown("### Portfolio Summary")
                 portfolio_df = pd.DataFrame(portfolio_data)
-                st.dataframe(
-                    portfolio_df,
-                    use_container_width=True,
-                    column_config={
-                        "Sentiment": st.column_config.TextColumn(help="AI-driven sentiment from Reddit posts.")
-                    }
-                )
-
-                # Export Functionality for Portfolio Summary
+                st.dataframe(portfolio_df, use_container_width=True)
                 csv = portfolio_df.to_csv(index=False)
                 st.download_button(
                     label="Download Portfolio Summary as CSV",
@@ -910,11 +1631,37 @@ if portfolio_input and shares_input:
                     file_name=f"portfolio_summary_{datetime.now().strftime('%Y%m%d')}.csv",
                     mime="text/csv"
                 )
-
-                # Portfolio simulator
+                # Portfolio Allocation Chart
+                st.markdown("### Portfolio Allocation")
+                values = [float(item["Value"].replace("$", "")) for item in portfolio_data]
+                labels = [item["Ticker"] for item in portfolio_data]
+                axis_text_color = "#000000" if st.session_state.theme == "light" else "#FFFFFF"
+                fig = go.Figure(data=[
+                    go.Pie(
+                        labels=labels,
+                        values=values,
+                        textinfo='label+percent',
+                        marker=dict(colors=st.session_state.theme_styles["bar_colors"][:len(labels)]),
+                        textfont=dict(color=axis_text_color)
+                    )
+                ])
+                fig.update_layout(
+                    title=dict(
+                        text="Portfolio Allocation by Value",
+                        font=dict(size=20, color=axis_text_color),
+                        x=0.5,
+                        xanchor="center"
+                    ),
+                    plot_bgcolor=st.session_state.theme_styles["plot_bg"],
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="Arial", size=12, color=axis_text_color),
+                    height=500,
+                    margin=dict(l=50, r=50, t=80, b=50)
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                # Portfolio Simulator
                 st.markdown("### Portfolio Simulator")
                 st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Estimate your portfolio’s growth over time.</p>', unsafe_allow_html=True)
-                st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">**Note**: The S&P 500 average annual return over the past 100 years is approximately 10.3% (including dividends). Use this as a reference for growth rate.</p>', unsafe_allow_html=True)
                 current_age = st.number_input("Enter your current age:", min_value=18, max_value=100, value=30, step=1)
                 retirement_age = 65
                 years_to_retirement = max(retirement_age - current_age, 1)
@@ -926,8 +1673,47 @@ if portfolio_input and shares_input:
                 st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Current Portfolio Value: ${total_value:,.2f}</p>', unsafe_allow_html=True)
                 st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Future Value ({years} years, {growth_rate}% growth): ${future_value:,.2f}</p>', unsafe_allow_html=True)
                 st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Value at Retirement (Age {retirement_age}, {years_to_retirement} years, {growth_rate}% growth): ${retirement_value:,.2f}</p>', unsafe_allow_html=True)
+                # Growth Over Time Chart
+                years_range = range(years + 1)
+                growth_values = [total_value * (1 + growth_rate / 100) ** t for t in years_range]
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=list(years_range),
+                    y=growth_values,
+                    mode="lines",
+                    name="Portfolio Value",
+                    line=dict(color=st.session_state.theme_styles["line"], width=2)
+                ))
+                fig.update_layout(
+                    title=dict(
+                        text="Portfolio Growth Over Time",
+                        font=dict(size=20, color=axis_text_color),
+                        x=0.5,
+                        xanchor="center"
+                    ),
+                    xaxis_title="Years",
+                    yaxis_title="Portfolio Value (USD)",
+                    plot_bgcolor=st.session_state.theme_styles["plot_bg"],
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="Arial", size=12, color=axis_text_color),
+                    xaxis=dict(
+                        title=dict(text="Years", font=dict(color=axis_text_color, size=14)),
+                        tickfont=dict(family="Arial", size=12, color=axis_text_color),
+                        gridcolor=st.session_state.theme_styles["grid"],
+                        zeroline=False
+                    ),
+                    yaxis=dict(
+                        title=dict(text="Portfolio Value (USD)", font=dict(color=axis_text_color, size=14)),
+                        tickfont=dict(family="Arial", size=12, color=axis_text_color),
+                        gridcolor=st.session_state.theme_styles["grid"],
+                        zeroline=False
+                    ),
+                    height=500,
+                    margin=dict(l=50, r=50, t=80, b=50)
+                )
+                st.plotly_chart(fig, use_container_width=True)
     except ValueError:
-        st.error("Invalid shares input. Please enter numbers (e.g., 100,50).")
+        st.error("Invalid input for shares or purchase prices. Please enter numbers (e.g., 100,50 for shares; 150.00,300.00 for prices).")
 
 # Reddit Sentiment
 st.subheader("🗣️ Reddit Sentiment")
@@ -939,47 +1725,28 @@ if sentiment_ticker:
         try:
             subreddits = ["wallstreetbets", "stocks"]
             posts = []
+            sentiment_scores = []
             for subreddit in subreddits:
                 for submission in reddit.subreddit(subreddit).search(sentiment_ticker, limit=5):
                     text = submission.title + " " + (submission.selftext[:200] if submission.selftext else "")
                     score = analyzer.polarity_scores(text)["compound"]
                     sentiment = "Positive" if score > 0.05 else "Negative" if score < -0.05 else "Neutral"
+                    sentiment_scores.append(score)
                     posts.append({
                         "Title": submission.title,
                         "URL": submission.url,
-                        "Snippet": submission.selftext[:100] + "..." if submission.selftext else "No text",
                         "Sentiment": f"{sentiment} ({score:.2f})",
-                        "Reddit Score": submission.score,
-                        "Date": datetime.utcfromtimestamp(submission.created_utc).strftime("%Y-%m-%d")
+                        "Date": datetime.utcfromtimestamp(submission.created_utc).strftime("%Y-%m-%d"),
+                        "Subreddit": subreddit
                     })
             if posts:
-                st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Overall Sentiment: {get_sentiment(sentiment_ticker)}</p>', unsafe_allow_html=True)
-                st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}"><strong>Sentiment Score Explanation:</strong> The score ranges from -1 (most negative) to +1 (most positive). Here’s what it means:<br>'
-                            f'• <strong>Excellent</strong>: > 0.5 (highly positive sentiment)<br>'
-                            f'• <strong>Good</strong>: 0.05 to 0.5 (positive sentiment)<br>'
-                            f'• <strong>Neutral</strong>: -0.05 to 0.05 (neutral sentiment)<br>'
-                            f'• <strong>Bad</strong>: -0.5 to -0.05 (negative sentiment)<br>'
-                            f'• <strong>Very Bad</strong>: < -0.5 (highly negative sentiment)<br>'
-                            f'For example, a score of 0.09 indicates a slightly positive ("Good") sentiment.</p>', unsafe_allow_html=True)
-                st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}"><strong>Reddit Score Explanation:</strong> The Reddit Score is the net upvotes (upvotes minus downvotes) a post has received. It reflects the post’s popularity or community agreement:<br>'
-                            f'• <strong>High Score</strong> (e.g., > 500): Indicates strong community engagement or agreement.<br>'
-                            f'• <strong>Moderate Score</strong> (50–500): Moderate attention from the community.<br>'
-                            f'• <strong>Low Score</strong> (< 50): Limited community impact.<br>'
-                            f'A high score on a positive sentiment post may suggest strong community optimism about the stock.</p>', unsafe_allow_html=True)
+                avg_score = np.mean(sentiment_scores)
+                overall_sentiment = "Positive" if avg_score > 0.05 else "Negative" if avg_score < -0.05 else "Neutral"
+                st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Overall Sentiment: {overall_sentiment} ({avg_score:.2f})</p>', unsafe_allow_html=True)
+                st.markdown("**Sentiment Explanation**: Scores range from -1 (most negative) to +1 (most positive). Above 0.05 is Positive, below -0.05 is Negative, and between -0.05 and 0.05 is Neutral.")
                 st.markdown("### Recent Reddit Posts")
                 reddit_df = pd.DataFrame(posts)
-                st.dataframe(
-                    reddit_df,
-                    use_container_width=True,
-                    column_config={
-                        "Title": st.column_config.LinkColumn(label="Title", help="Click to read the full post on Reddit"),
-                        "URL": st.column_config.LinkColumn(label="Reddit Post URL", help="Click to read the full post on Reddit"),
-                        "Sentiment": st.column_config.TextColumn(help="AI-driven sentiment score for this post."),
-                        "Reddit Score": st.column_config.NumberColumn(help="Net upvotes (upvotes minus downvotes) received on Reddit.")
-                    }
-                )
-
-                # Export Functionality for Reddit Sentiment
+                st.dataframe(reddit_df, use_container_width=True)
                 csv = reddit_df.to_csv(index=False)
                 st.download_button(
                     label="Download Reddit Sentiment as CSV",
@@ -987,387 +1754,149 @@ if sentiment_ticker:
                     file_name=f"reddit_sentiment_{sentiment_ticker}_{datetime.now().strftime('%Y%m%d')}.csv",
                     mime="text/csv"
                 )
-
+                # Sentiment Distribution
+                st.markdown("### Sentiment Distribution")
+                sentiment_counts = reddit_df["Sentiment"].apply(lambda x: x.split(" (")[0]).value_counts()
+                axis_text_color = "#000000" if st.session_state.theme == "light" else "#FFFFFF"
+                fig = go.Figure(data=[
+                    go.Pie(
+                        labels=sentiment_counts.index,
+                        values=sentiment_counts.values,
+                        textinfo='label+percent',
+                        marker=dict(colors=st.session_state.theme_styles["bar_colors"][:len(sentiment_counts)]),
+                        textfont=dict(color=axis_text_color)
+                    )
+                ])
+                fig.update_layout(
+                    title=dict(
+                        text="Sentiment Distribution",
+                        font=dict(size=20, color=axis_text_color),
+                        x=0.5,
+                        xanchor="center"
+                    ),
+                    plot_bgcolor=st.session_state.theme_styles["plot_bg"],
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="Arial", size=12, color=axis_text_color),
+                    height=500,
+                    margin=dict(l=50, r=50, t=80, b=50)
+                )
+                st.plotly_chart(fig, use_container_width=True)
             else:
                 st.warning(f"No Reddit posts found for {sentiment_ticker}.")
         except Exception as e:
-            st.error(f"Error fetching Reddit posts: {str(e)}. Please check API credentials.")
+            logger.error(f"Error fetching Reddit posts for {sentiment_ticker}: {str(e)}")
+            st.error(f"Error fetching Reddit posts: {str(e)}.")
 
-# Stock News
+# News Section
+import streamlit as st
+import logging
+import os
+from urllib.parse import quote
+
+# Create log file if it doesn't exist
+if not os.path.exists('stock_news.log'):
+    with open('stock_news.log', 'w') as f:
+        f.write('')
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='stock_news.log'
+)
+logger = logging.getLogger(__name__)
+
+# Initialize session state for API requests (for compatibility, though unused)
+if "api_requests_made" not in st.session_state:
+    st.session_state.api_requests_made = 0
+
+# Function to generate Google News search URL
+def generate_google_news_url(ticker: str) -> str:
+    try:
+        logger.info(f"Generating Google News URL for ticker: {ticker}")
+        # Create query like "Recent TSLA news"
+        query = f"Recent {ticker} news"
+        # URL-encode the query
+        encoded_query = quote(query)
+        # Construct Google News search URL
+        url = f"https://www.google.com/search?q={encoded_query}&tbm=nws"
+        logger.info(f"Generated URL: {url}")
+        return url
+    except Exception as e:
+        logger.error(f"Error generating Google News URL for {ticker}: {str(e)}")
+        return ""
+
+# UI: Ticker input and Google News link
 st.subheader("📰 Stock News")
-st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Latest news articles related to the stock.</p>', unsafe_allow_html=True)
+st.markdown(
+    '<p style="color:#000000">Enter a stock ticker to search for recent news on Google.</p>',
+    unsafe_allow_html=True
+)
 
-if stock_ticker:
-    with st.spinner(f"Fetching news for {stock_ticker}..."):
-        try:
-            stock = yf.Ticker(stock_ticker)
-            news_items = stock.news
-            if news_items and any("title" in item or "headline" in item for item in news_items):
-                news_data = []
-                for item in news_items[:5]:
-                    title = item.get("title") or item.get("headline") or "N/A"
-                    link = item.get("link") or item.get("url") or "#"
-                    publisher = item.get("publisher") or item.get("source") or "Unknown"
-                    timestamp = item.get("providerPublishTime") or item.get("publishedAt") or 0
-                    date = datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d") if timestamp else "N/A"
-                    summary = item.get("summary") or item.get("description") or "No summary available."
-                    if len(summary) > 100:
-                        summary = summary[:100] + "..."
-                    news_data.append({
-                        "Title": title,
-                        "URL": link,
-                        "Publisher": publisher,
-                        "Date": date,
-                        "Summary": summary
-                    })
-            else:
-                news_data = None
-        except Exception as e:
-            st.warning(f"Failed to fetch news from Yahoo Finance: {str(e)}. Falling back to NewsAPI.")
-            news_data = None
-
-        if not news_data:
-            try:
-                import requests
-                newsapi_key = "57d660f019654d129b06bba77f1014d4"
-                ticker_to_company = {
-                    "AAPL": "Apple",
-                    "MSFT": "Microsoft",
-                    "GOOGL": "Google",
-                    "AMZN": "Amazon",
-                    "TSLA": "Tesla"
-                }
-                company_name = ticker_to_company.get(stock_ticker, stock_ticker)
-                query = f"{company_name} ({stock_ticker} OR stock OR earnings OR finance OR shares OR market)"
-                url = f"https://newsapi.org/v2/everything?q={query}&apiKey={newsapi_key}&language=en&sortBy=publishedAt"
-                response = requests.get(url)
-                response.raise_for_status()
-                news_items = response.json().get("articles", [])
-                if news_items:
-                    news_data = []
-                    seen_urls = set()
-                    stock_keywords = ["stock", "earnings", "finance", "shares", "market", stock_ticker.lower()]
-                    for item in news_items[:15]:
-                        title = item.get("title", "N/A").lower()
-                        summary = item.get("description", "No summary available.").lower()
-                        link = item.get("url", "#")
-                        if link in seen_urls:
-                            continue
-                        is_relevant = any(keyword in title or keyword in summary for keyword in stock_keywords)
-                        if not is_relevant:
-                            continue
-                        seen_urls.add(link)
-                        publisher = item.get("source", {}).get("name", "Unknown")
-                        date = item.get("publishedAt", "N/A")
-                        if date != "N/A":
-                            date = date.split("T")[0]
-                        summary = item.get("description", "No summary available.")
-                        if len(summary) > 100:
-                            summary = summary[:100] + "..."
-                        news_data.append({
-                            "Title": item.get("title", "N/A"),
-                            "URL": link,
-                            "Publisher": publisher,
-                            "Date": date,
-                            "Summary": summary
-                        })
-                        if len(news_data) >= 5:
-                            break
-                    if not news_data:
-                        st.warning(f"No relevant news articles found for {stock_ticker} using NewsAPI.")
-                else:
-                    st.warning(f"No news found for {stock_ticker} using NewsAPI.")
-                    news_data = None
-            except Exception as e:
-                st.error(f"Error fetching news from NewsAPI: {str(e)}. Please check your API key or internet connection.")
-                news_data = None
-
-        if news_data and any(row["Title"] != "N/A" for row in news_data):
-            st.markdown("### Recent News Articles")
-            news_df = pd.DataFrame(news_data)
-            st.dataframe(
-                news_df,
-                use_container_width=True,
-                column_config={
-                    "Title": st.column_config.LinkColumn(label="Title", help="Click to read the full article"),
-                    "URL": st.column_config.LinkColumn(label="Article URL", help="Click to read the full article"),
-                    "Summary": st.column_config.TextColumn(help="A brief summary of the article.")
-                }
+news_ticker = st.text_input("Enter a ticker for news:", value="AAPL").strip().upper()
+if news_ticker:
+    with st.spinner(f"Generating news search for {news_ticker}..."):
+        google_news_url = generate_google_news_url(news_ticker)
+        if google_news_url:
+            st.markdown("### Recent News Search")
+            st.markdown(
+                f'<p style="color:#000000">\n'
+                f'Click the link below to view recent news for {news_ticker} on Google News:<br>'
+                f'<a href="{google_news_url}" target="_blank">Search Google News for {news_ticker}</a></p>',
+                unsafe_allow_html=True
             )
+        else:
+            st.error("Error generating news search URL. Please try again.")
 
-            # Export functionality
-            csv = news_df.to_csv(index=False)
-            st.download_button(
-                label="Download Stock News as CSV",
-                data=csv,
-                file_name=f"stock_news_{stock_ticker}_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv"
-            )
-        elif not news_data:
-            st.warning("Unable to fetch news articles from any source.")
 
 # Stock Screener
 st.subheader("🔎 Stock Screener")
-st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Find stocks based on multiple financial metrics.</p>', unsafe_allow_html=True)
+st.markdown(f'<p style="color:{st.session_state.theme_styles["text"]}">Screen stocks based on your criteria.</p>', unsafe_allow_html=True)
 
-# Expanded list of stocks with additional metrics
-stock_list = [
-    {"Ticker": "AAPL", "Company Name": "Apple Inc.", "Sector": "Technology", "Market Cap": 2.5e12, "P/E Ratio": 28.5, "P/B Ratio": 36.0, "Dividend Yield": 0.5, "Beta": 1.2, "Revenue Growth": 5.0, "Debt/Equity": 1.8, "ROE": 150.0, "P/S Ratio": 7.0},
-    {"Ticker": "MSFT", "Company Name": "Microsoft Corporation", "Sector": "Technology", "Market Cap": 2.1e12, "P/E Ratio": 35.0, "P/B Ratio": 12.0, "Dividend Yield": 0.8, "Beta": 0.9, "Revenue Growth": 15.0, "Debt/Equity": 0.5, "ROE": 40.0, "P/S Ratio": 10.0},
-    {"Ticker": "GOOGL", "Company Name": "Alphabet Inc.", "Sector": "Technology", "Market Cap": 1.8e12, "P/E Ratio": 25.0, "P/B Ratio": 6.5, "Dividend Yield": 0.0, "Beta": 1.0, "Revenue Growth": 10.0, "Debt/Equity": 0.1, "ROE": 25.0, "P/S Ratio": 6.0},
-    {"Ticker": "JPM", "Company Name": "JPMorgan Chase & Co.", "Sector": "Financials", "Market Cap": 5.0e11, "P/E Ratio": 12.0, "P/B Ratio": 1.5, "Dividend Yield": 2.5, "Beta": 1.1, "Revenue Growth": 3.0, "Debt/Equity": 1.2, "ROE": 15.0, "P/S Ratio": 3.0},
-    {"Ticker": "BAC", "Company Name": "Bank of America", "Sector": "Financials", "Market Cap": 3.5e11, "P/E Ratio": 14.5, "P/B Ratio": 1.2, "Dividend Yield": 2.0, "Beta": 1.3, "Revenue Growth": 2.0, "Debt/Equity": 1.5, "ROE": 10.0, "P/S Ratio": 2.5},
-    {"Ticker": "XOM", "Company Name": "Exxon Mobil Corporation", "Sector": "Energy", "Market Cap": 4.0e11, "P/E Ratio": 15.0, "P/B Ratio": 2.0, "Dividend Yield": 5.0, "Beta": 0.9, "Revenue Growth": -5.0, "Debt/Equity": 0.8, "ROE": 12.0, "P/S Ratio": 1.5},
-    {"Ticker": "CVX", "Company Name": "Chevron Corporation", "Sector": "Energy", "Market Cap": 3.0e11, "P/E Ratio": 13.5, "P/B Ratio": 1.8, "Dividend Yield": 4.5, "Beta": 1.0, "Revenue Growth": -3.0, "Debt/Equity": 0.7, "ROE": 10.0, "P/S Ratio": 1.8},
-    {"Ticker": "PFE", "Company Name": "Pfizer Inc.", "Sector": "Healthcare", "Market Cap": 2.5e11, "P/E Ratio": 10.0, "P/B Ratio": 2.5, "Dividend Yield": 4.0, "Beta": 0.6, "Revenue Growth": 8.0, "Debt/Equity": 0.9, "ROE": 20.0, "P/S Ratio": 2.0},
-    {"Ticker": "JNJ", "Company Name": "Johnson & Johnson", "Sector": "Healthcare", "Market Cap": 4.5e11, "P/E Ratio": 16.0, "P/B Ratio": 5.0, "Dividend Yield": 2.8, "Beta": 0.5, "Revenue Growth": 4.0, "Debt/Equity": 0.4, "ROE": 30.0, "P/S Ratio": 4.5},
-    {"Ticker": "WMT", "Company Name": "Walmart Inc.", "Sector": "Consumer Staples", "Market Cap": 4.0e11, "P/E Ratio": 20.0, "P/B Ratio": 4.0, "Dividend Yield": 1.5, "Beta": 0.4, "Revenue Growth": 3.0, "Debt/Equity": 0.6, "ROE": 20.0, "P/S Ratio": 0.8},
-    {"Ticker": "PG", "Company Name": "Procter & Gamble", "Sector": "Consumer Staples", "Market Cap": 3.5e11, "P/E Ratio": 22.0, "P/B Ratio": 6.0, "Dividend Yield": 2.4, "Beta": 0.3, "Revenue Growth": 2.0, "Debt/Equity": 0.5, "ROE": 25.0, "P/S Ratio": 4.0},
-    {"Ticker": "TSLA", "Company Name": "Tesla, Inc.", "Sector": "Consumer Discretionary", "Market Cap": 8.0e11, "P/E Ratio": 50.0, "P/B Ratio": 15.0, "Dividend Yield": 0.0, "Beta": 2.0, "Revenue Growth": 30.0, "Debt/Equity": 0.3, "ROE": 25.0, "P/S Ratio": 8.0},
-    {"Ticker": "AMZN", "Company Name": "Amazon.com, Inc.", "Sector": "Consumer Discretionary", "Market Cap": 1.7e12, "P/E Ratio": 45.0, "P/B Ratio": 8.0, "Dividend Yield": 0.0, "Beta": 1.2, "Revenue Growth": 20.0, "Debt/Equity": 0.4, "ROE": 20.0, "P/S Ratio": 4.0}
-]
+screener_tickers = st.text_input("Enter tickers to screen (comma-separated, e.g., AAPL,MSFT,GOOGL):", value="AAPL,MSFT,GOOGL").strip().upper()
+min_pe = st.number_input("Minimum P/E Ratio:", value=0.0, step=1.0)
+max_pe = st.number_input("Maximum P/E Ratio:", value=50.0, step=1.0)
+min_pb = st.number_input("Minimum P/B Ratio:", value=0.0, step=0.1)
+max_pb = st.number_input("Maximum P/B Ratio:", value=10.0, step=0.1)
+min_dividend = st.number_input("Minimum Dividend Yield (%):", value=0.0, step=0.1)
 
-# Convert stock list to DataFrame
-stocks_df = pd.DataFrame(stock_list)
-
-# Function to format Market Cap for display
-def format_market_cap(market_cap):
-    if market_cap >= 1_000_000_000_000:
-        return f"${market_cap / 1_000_000_000_000:.2f}T"
-    elif market_cap >= 1_000_000_000:
-        return f"${market_cap / 1_000_000_000:.2f}B"
+if screener_tickers:
+    tickers = [t.strip() for t in screener_tickers.split(",")]
+    screener_data = []
+    with st.spinner("Screening stocks..."):
+        for ticker in tickers:
+            stock_info, error = get_stock_info(ticker)
+            if stock_info:
+                pe_ratio = float(stock_info.get("PERatio", stock_info.get("trailingPE", float('inf'))))
+                pb_ratio = float(stock_info.get("PriceToBookRatio", stock_info.get("priceToBook", float('inf'))))
+                dividend_yield = float(stock_info.get("DividendYield", stock_info.get("dividendYield", 0))) * 100
+                if (min_pe <= pe_ratio <= max_pe) and (min_pb <= pb_ratio <= max_pb) and (dividend_yield >= min_dividend):
+                    screener_data.append({
+                        "Ticker": ticker,
+                        "P/E Ratio": f"{pe_ratio:.2f}" if pe_ratio != float('inf') else "N/A",
+                        "P/B Ratio": f"{pb_ratio:.2f}" if pb_ratio != float('inf') else "N/A",
+                        "Dividend Yield": f"{dividend_yield:.2f}%"
+                    })
+            else:
+                logger.warning(f"Could not fetch data for {ticker} during screening: {error}")
+    if screener_data:
+        st.markdown("### Screening Results")
+        screener_df = pd.DataFrame(screener_data)
+        st.dataframe(screener_df, use_container_width=True)
+        csv = screener_df.to_csv(index=False)
+        st.download_button(
+            label="Download Screening Results as CSV",
+            data=csv,
+            file_name=f"stock_screener_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
     else:
-        return f"${market_cap / 1_000_000:.2f}M"
+        st.warning("No stocks match your criteria.")
 
-stocks_df["Market Cap"] = stocks_df["Market Cap"].apply(format_market_cap)
-stocks_df["Dividend Yield"] = stocks_df["Dividend Yield"].apply(lambda x: f"{x:.1f}%")
-stocks_df["Revenue Growth"] = stocks_df["Revenue Growth"].apply(lambda x: f"{x:.1f}%")
-stocks_df["Debt/Equity"] = stocks_df["Debt/Equity"].apply(lambda x: f"{x:.2f}")
-stocks_df["ROE"] = stocks_df["ROE"].apply(lambda x: f"{x:.1f}%")
-stocks_df["P/S Ratio"] = stocks_df["P/S Ratio"].apply(lambda x: f"{x:.2f}")
-
-# Filters
-st.markdown("### Filter Stocks")
-sectors = sorted(stocks_df["Sector"].unique())
-selected_sectors = st.multiselect("Select Sectors:", sectors, default=sectors)
-
-# Market Cap filter
-market_cap_min, market_cap_max = st.slider(
-    "Market Cap Range ($B):",
-    min_value=0.0,
-    max_value=3000.0,
-    value=(0.0, 3000.0),
-    step=10.0
+# Footer
+st.markdown("---")
+st.markdown(
+    f'<p style="color:{st.session_state.theme_styles["text"]};text-align:center">'
+    f'Powered by Alpha Vantage, yfinance, Reddit, and Streamlit | © 2025 EquityScope</p>',
+    unsafe_allow_html=True
 )
-
-# P/E Ratio filter
-pe_min, pe_max = st.slider(
-    "P/E Ratio Range:",
-    min_value=0.0,
-    max_value=60.0,
-    value=(0.0, 60.0),
-    step=1.0
-)
-
-# P/B Ratio filter
-pb_min, pb_max = st.slider(
-    "P/B Ratio Range:",
-    min_value=0.0,
-    max_value=40.0,
-    value=(0.0, 40.0),
-    step=1.0
-)
-
-# Dividend Yield filter
-div_min, div_max = st.slider(
-    "Dividend Yield Range (%):",
-    min_value=0.0,
-    max_value=6.0,
-    value=(0.0, 6.0),
-    step=0.1
-)
-
-# Beta filter
-beta_min, beta_max = st.slider(
-    "Beta Range:",
-    min_value=0.0,
-    max_value=2.5,
-    value=(0.0, 2.5),
-    step=0.1
-)
-
-# Revenue Growth filter
-rev_growth_min, rev_growth_max = st.slider(
-    "Revenue Growth Range (%):",
-    min_value=-10.0,
-    max_value=35.0,
-    value=(-10.0, 35.0),
-    step=1.0
-)
-
-# Debt/Equity filter
-debt_equity_min, debt_equity_max = st.slider(
-    "Debt/Equity Range:",
-    min_value=0.0,
-    max_value=2.0,
-    value=(0.0, 2.0),
-    step=0.1
-)
-
-# ROE filter
-roe_min, roe_max = st.slider(
-    "ROE Range (%):",
-    min_value=0.0,
-    max_value=160.0,
-    value=(0.0, 160.0),
-    step=1.0
-)
-
-# P/S Ratio filter
-ps_min, ps_max = st.slider(
-    "P/S Ratio Range:",
-    min_value=0.0,
-    max_value=12.0,
-    value=(0.0, 12.0),
-    step=0.5
-)
-
-# Apply filters
-filtered_df = stocks_df.copy()
-
-# Filter by sector
-filtered_df = filtered_df[filtered_df["Sector"].isin(selected_sectors)]
-
-# Convert Market Cap back to numeric for filtering
-filtered_df["Market Cap Numeric"] = filtered_df["Market Cap"].apply(
-    lambda x: float(x.replace("$", "").replace("T", "e12").replace("B", "e9").replace("M", "e6"))
-)
-filtered_df = filtered_df[
-    (filtered_df["Market Cap Numeric"] >= market_cap_min * 1e9) &
-    (filtered_df["Market Cap Numeric"] <= market_cap_max * 1e9)
-]
-
-# Filter by P/E Ratio
-filtered_df = filtered_df[
-    (filtered_df["P/E Ratio"] >= pe_min) &
-    (filtered_df["P/E Ratio"] <= pe_max)
-]
-
-# Filter by P/B Ratio
-filtered_df = filtered_df[
-    (filtered_df["P/B Ratio"] >= pb_min) &
-    (filtered_df["P/B Ratio"] <= pb_max)
-]
-
-# Filter by Dividend Yield
-filtered_df["Dividend Yield Numeric"] = filtered_df["Dividend Yield"].str.replace("%", "").astype(float)
-filtered_df = filtered_df[
-    (filtered_df["Dividend Yield Numeric"] >= div_min) &
-    (filtered_df["Dividend Yield Numeric"] <= div_max)
-]
-
-# Filter by Beta
-filtered_df = filtered_df[
-    (filtered_df["Beta"] >= beta_min) &
-    (filtered_df["Beta"] <= beta_max)
-]
-
-# Filter by Revenue Growth
-filtered_df["Revenue Growth Numeric"] = filtered_df["Revenue Growth"].str.replace("%", "").astype(float)
-filtered_df = filtered_df[
-    (filtered_df["Revenue Growth Numeric"] >= rev_growth_min) &
-    (filtered_df["Revenue Growth Numeric"] <= rev_growth_max)
-]
-
-# Filter by Debt/Equity
-filtered_df["Debt/Equity Numeric"] = filtered_df["Debt/Equity"].astype(float)
-filtered_df = filtered_df[
-    (filtered_df["Debt/Equity Numeric"] >= debt_equity_min) &
-    (filtered_df["Debt/Equity Numeric"] <= debt_equity_max)
-]
-
-# Filter by ROE
-filtered_df["ROE Numeric"] = filtered_df["ROE"].str.replace("%", "").astype(float)
-filtered_df = filtered_df[
-    (filtered_df["ROE Numeric"] >= roe_min) &
-    (filtered_df["ROE Numeric"] <= roe_max)
-]
-
-# Filter by P/S Ratio
-filtered_df["P/S Ratio Numeric"] = filtered_df["P/S Ratio"].astype(float)
-filtered_df = filtered_df[
-    (filtered_df["P/S Ratio Numeric"] >= ps_min) &
-    (filtered_df["P/S Ratio Numeric"] <= ps_max)
-]
-
-# Drop temporary numeric columns
-filtered_df = filtered_df.drop(columns=["Market Cap Numeric", "Dividend Yield Numeric", "Revenue Growth Numeric", "Debt/Equity Numeric", "ROE Numeric", "P/S Ratio Numeric"])
-
-# Sort options
-sort_column = st.selectbox("Sort By:", ["Ticker", "Market Cap", "P/E Ratio", "P/B Ratio", "Dividend Yield", "Beta", "Revenue Growth", "Debt/Equity", "ROE", "P/S Ratio"])
-sort_order = st.radio("Sort Order:", ["Ascending", "Descending"])
-sort_ascending = True if sort_order == "Ascending" else False
-
-# Convert columns for proper sorting
-if sort_column == "Market Cap":
-    filtered_df["Market Cap Sort"] = filtered_df["Market Cap"].apply(
-        lambda x: float(x.replace("$", "").replace("T", "e12").replace("B", "e9").replace("M", "e6"))
-    )
-    sort_key = "Market Cap Sort"
-elif sort_column == "Dividend Yield":
-    filtered_df["Dividend Yield Sort"] = filtered_df["Dividend Yield"].str.replace("%", "").astype(float)
-    sort_key = "Dividend Yield Sort"
-elif sort_column == "Revenue Growth":
-    filtered_df["Revenue Growth Sort"] = filtered_df["Revenue Growth"].str.replace("%", "").astype(float)
-    sort_key = "Revenue Growth Sort"
-elif sort_column == "Debt/Equity":
-    filtered_df["Debt/Equity Sort"] = filtered_df["Debt/Equity"].astype(float)
-    sort_key = "Debt/Equity Sort"
-elif sort_column == "ROE":
-    filtered_df["ROE Sort"] = filtered_df["ROE"].str.replace("%", "").astype(float)
-    sort_key = "ROE Sort"
-elif sort_column == "P/S Ratio":
-    filtered_df["P/S Ratio Sort"] = filtered_df["P/S Ratio"].astype(float)
-    sort_key = "P/S Ratio Sort"
-else:
-    sort_key = sort_column
-
-# Apply sorting
-filtered_df = filtered_df.sort_values(by=sort_key, ascending=sort_ascending)
-
-# Drop temporary sort columns if they exist
-columns_to_drop = ["Market Cap Sort", "Dividend Yield Sort", "Revenue Growth Sort", "Debt/Equity Sort", "ROE Sort", "P/S Ratio Sort"]
-filtered_df = filtered_df.drop(columns=[col for col in columns_to_drop if col in filtered_df.columns])
-
-# Display results
-st.markdown("### Filtered Stocks")
-if not filtered_df.empty:
-    st.dataframe(
-        filtered_df,
-        use_container_width=True,
-        column_config={
-            "Ticker": st.column_config.TextColumn(help="Stock ticker symbol"),
-            "Company Name": st.column_config.TextColumn(help="Name of the company"),
-            "Sector": st.column_config.TextColumn(help="Industry sector"),
-            "Market Cap": st.column_config.TextColumn("Market Cap", help="Total market capitalization"),
-            "P/E Ratio": st.column_config.NumberColumn("P/E Ratio", help="Price-to-Earnings ratio"),
-            "P/B Ratio": st.column_config.NumberColumn("P/B Ratio", help="Price-to-Book ratio"),
-            "Dividend Yield": st.column_config.TextColumn("Dividend Yield", help="Annual dividend yield percentage"),
-            "Beta": st.column_config.NumberColumn("Beta", help="Measure of stock volatility relative to the market"),
-            "Revenue Growth": st.column_config.TextColumn("Revenue Growth", help="Annual revenue growth percentage"),
-            "Debt/Equity": st.column_config.TextColumn("Debt/Equity", help="Debt-to-Equity ratio"),
-            "ROE": st.column_config.TextColumn("ROE", help="Return on Equity percentage"),
-            "P/S Ratio": st.column_config.TextColumn("P/S Ratio", help="Price-to-Sales ratio")
-        }
-    )
-
-    # Export functionality
-    csv = filtered_df.to_csv(index=False)
-    st.download_button(
-        label="Download Filtered Stocks as CSV",
-        data=csv,
-        file_name=f"stock_screener_results_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv"
-    )
-else:
-    st.warning("No stocks match the selected criteria. Try adjusting the filters.")
